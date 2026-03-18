@@ -115,9 +115,8 @@ fn main() {
     }
 
     // Keep tx alive for spawning new supervisors during config reload.
-    // The main loop breaks explicitly on shutdown, so we don't need channel close.
 
-    draw_status(&status_bar, &scripts);
+    status_bar.draw(&script_views(&scripts));
 
     for event in &rx {
         // Detect Ctrl+C: shutdown was triggered externally
@@ -133,18 +132,16 @@ fn main() {
                     open_url(&urls[idx].url);
                 }
                 url_dialog_open = false;
-                draw_status(&status_bar, &scripts);
+                status_bar.draw(&script_views(&scripts));
             }
             Event::Keypress(_) if url_dialog_open => {
-                // Any key (including Escape) dismisses the dialog
                 url_dialog_open = false;
-                draw_status(&status_bar, &scripts);
+                status_bar.draw(&script_views(&scripts));
             }
             // --- Normal mode ---
             Event::Keypress(b'o') if !shutting_down && !urls.is_empty() => {
                 url_dialog_open = true;
-                status_bar.draw_url_dialog(&urls);
-                draw_status(&status_bar, &scripts);
+                status_bar.draw_url_dialog(&urls, &script_views(&scripts));
             }
             Event::Keypress(b'q') if !shutting_down => {
                 shutting_down = true;
@@ -155,7 +152,6 @@ fn main() {
                 if idx < scripts.len() {
                     scripts[idx].visible = !scripts[idx].visible;
                     replay_visible(&status_bar, &log, &scripts);
-                    draw_status(&status_bar, &scripts);
                 }
             }
             Event::Output(OutputLine::Stdout {
@@ -179,9 +175,7 @@ fn main() {
                         },
                     );
                     if visible {
-                        status_bar.clear();
-                        status_bar.print_line(&formatted);
-                        draw_status(&status_bar, &scripts);
+                        status_bar.print_line_with_status(&formatted, &script_views(&scripts));
                     }
                 }
             }
@@ -206,9 +200,7 @@ fn main() {
                         },
                     );
                     if visible {
-                        status_bar.clear();
-                        status_bar.print_line(&formatted);
-                        draw_status(&status_bar, &scripts);
+                        status_bar.print_line_with_status(&formatted, &script_views(&scripts));
                     }
                 }
             }
@@ -216,7 +208,8 @@ fn main() {
                 script_name: ref name,
                 code,
             }) => {
-                let was_stopping = scripts.iter().find(|s| &s.name == name).is_some_and(|s| s.stopping);
+                let was_stopping =
+                    scripts.iter().find(|s| &s.name == name).is_some_and(|s| s.stopping);
                 if let Some(script) = scripts.iter_mut().find(|s| &s.name == name) {
                     script.run_state = RunState::Exited(code);
                     let formatted = display::format_exit_line(
@@ -233,14 +226,18 @@ fn main() {
                             always_visible: true,
                         },
                     );
-                    status_bar.clear();
-                    status_bar.print_line(&formatted);
+                    // Can't call print_line_with_status here because we mutably borrowed scripts
+                    // So we'll draw after the borrow ends
                 }
-                // Remove scripts that were stopping (removed from config) now that they've exited
                 if was_stopping {
                     scripts.retain(|s| !(&s.name == name && s.stopping));
                 }
-                draw_status(&status_bar, &scripts);
+                // Redraw: find the formatted line from the log
+                if let Some(entry) = log.iter().rev().find(|e| &e.script_name == name && e.always_visible) {
+                    status_bar.print_line_with_status(&entry.formatted.clone(), &script_views(&scripts));
+                } else {
+                    status_bar.draw(&script_views(&scripts));
+                }
                 if shutting_down {
                     exited_count += 1;
                     if exited_count >= scripts.len() {
@@ -254,31 +251,29 @@ fn main() {
             }) => {
                 if let Some(script) = scripts.iter_mut().find(|s| &s.name == name) {
                     script.run_state = RunState::Restarting;
-                    draw_status(&status_bar, &scripts);
                 }
+                status_bar.draw(&script_views(&scripts));
             }
             Event::Output(OutputLine::Restarted {
                 script_name: ref name,
             }) => {
                 if let Some(script) = scripts.iter_mut().find(|s| &s.name == name) {
                     script.run_state = RunState::Running;
-                    let formatted = display::format_restart_line(
-                        &script.name,
-                        script.color,
-                        status_bar.name_width(),
-                    );
-                    push_log(
-                        &mut log,
-                        LogEntry {
-                            script_name: name.clone(),
-                            formatted: formatted.clone(),
-                            always_visible: true,
-                        },
-                    );
-                    status_bar.clear();
-                    status_bar.print_line(&formatted);
-                    draw_status(&status_bar, &scripts);
                 }
+                let formatted = display::format_restart_line(
+                    scripts.iter().find(|s| &s.name == name).map_or("?", |s| &s.name),
+                    scripts.iter().find(|s| &s.name == name).map_or(display::RESET, |s| s.color),
+                    status_bar.name_width(),
+                );
+                push_log(
+                    &mut log,
+                    LogEntry {
+                        script_name: name.clone(),
+                        formatted: formatted.clone(),
+                        always_visible: true,
+                    },
+                );
+                status_bar.print_line_with_status(&formatted, &script_views(&scripts));
             }
             Event::ConfigReloaded(new_config) => {
                 if shutting_down {
@@ -292,7 +287,7 @@ fn main() {
                     &tx,
                     &work_dir,
                 );
-                draw_status(&status_bar, &scripts);
+                status_bar.draw(&script_views(&scripts));
             }
             Event::ConfigError(ref msg) => {
                 let err_msg = format!(
@@ -302,9 +297,7 @@ fn main() {
                     msg,
                     display::RESET,
                 );
-                status_bar.clear();
-                status_bar.print_line(&err_msg);
-                draw_status(&status_bar, &scripts);
+                status_bar.print_line_with_status(&err_msg, &script_views(&scripts));
             }
             _ => {}
         }
@@ -329,7 +322,7 @@ fn apply_config_reload(
     // Mark removed and changed-cmd scripts as stopping
     for script in scripts.iter_mut() {
         if script.stopping {
-            continue; // already draining from a previous reload
+            continue;
         }
         match new_by_name.get(script.name.as_str()) {
             None => {
@@ -349,10 +342,9 @@ fn apply_config_reload(
     for new_cfg in &new_config.scripts {
         let existing = scripts.iter().find(|s| s.name == new_cfg.name && !s.stopping);
         if existing.is_some() {
-            continue; // unchanged, already running
+            continue;
         }
 
-        // Preserve visibility from old entry (even if stopping)
         let old_visible = scripts.iter().find(|s| s.name == new_cfg.name).map(|s| s.visible);
 
         let stop = Arc::new(AtomicBool::new(false));
@@ -391,18 +383,15 @@ fn apply_config_reload(
         script.color = display::assign_color(i);
     }
 
-    // Update name_width for all scripts (including stopping ones, they still produce output)
     let new_name_width = scripts.iter().map(|s| s.name.len()).max().unwrap_or(1);
     status_bar.set_name_width(new_name_width);
 
-    // Show reload confirmation
     let reload_msg = format!(
         "{}--- config reloaded ---{}",
         display::BOLD,
         display::RESET,
     );
-    status_bar.clear();
-    status_bar.print_line(&reload_msg);
+    status_bar.print_line_with_status(&reload_msg, &script_views(scripts));
 }
 
 fn spawn_supervisor(script: &ScriptState, tx: &mpsc::Sender<Event>, work_dir: &PathBuf) {
@@ -434,19 +423,18 @@ fn replay_visible(bar: &StatusBar, log: &[LogEntry], scripts: &[ScriptState]) {
         })
         .map(|e| e.formatted.as_str())
         .collect();
-    bar.replay(&visible_lines);
+    bar.replay(&visible_lines, &script_views(scripts));
 }
 
-fn draw_status(bar: &StatusBar, scripts: &[ScriptState]) {
-    let views: Vec<ScriptView> = scripts
+fn script_views(scripts: &[ScriptState]) -> Vec<ScriptView<'_>> {
+    scripts
         .iter()
         .map(|s| ScriptView {
             name: &s.name,
             visible: s.visible,
             run_state: &s.run_state,
         })
-        .collect();
-    bar.draw(&views);
+        .collect()
 }
 
 /// Open a URL in the default browser. Uses `open` on macOS, `xdg-open` on Linux.
@@ -456,6 +444,5 @@ fn open_url(url: &str) {
     } else {
         "xdg-open"
     };
-    // Spawn detached - we don't care about the result
     let _ = std::process::Command::new(cmd).arg(url).spawn();
 }
