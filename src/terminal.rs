@@ -49,6 +49,7 @@ fn stdin_fd() -> i32 {
 }
 
 extern "C" fn sigint_handler(_: i32) {
+    crate::process::trigger_shutdown();
     restore_terminal();
     // Re-raise SIGINT with default handler so the process exits with correct status
     unsafe {

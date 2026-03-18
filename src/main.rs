@@ -5,7 +5,7 @@ mod terminal;
 
 use process::{Event, OutputLine};
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::AtomicBool;
 use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
 use terminal::{RunState, ScriptView, StatusBar};
@@ -60,6 +60,10 @@ fn main() {
 
     let (tx, rx) = mpsc::channel::<Event>();
     let shutdown = Arc::new(AtomicBool::new(false));
+    let child_pids = Arc::new(Mutex::new(Vec::new()));
+
+    // Register globals so signal handler can access them
+    process::init_globals(shutdown.clone(), child_pids.clone());
 
     let _guard = terminal::RawModeGuard::new();
     let status_bar = StatusBar::new(name_width);
@@ -77,16 +81,13 @@ fn main() {
         .collect();
 
     let mut log: Vec<LogEntry> = Vec::new();
-    let child_pids: process::ChildPids = Arc::new(Mutex::new(Vec::new()));
 
     // Spawn supervisor threads
     for (i, cfg) in config.scripts.iter().enumerate() {
         let tx = tx.clone();
         let cmd = cfg.cmd.clone();
-        let shutdown = shutdown.clone();
         let cwd = work_dir.clone();
-        let pids = child_pids.clone();
-        std::thread::spawn(move || process::supervise(i, cmd, tx, shutdown, cwd, pids));
+        std::thread::spawn(move || process::supervise(i, cmd, tx, cwd));
     }
 
     // Spawn stdin reader
@@ -102,8 +103,7 @@ fn main() {
     for event in &rx {
         match event {
             Event::Keypress(b'q') => {
-                shutdown.store(true, Ordering::Relaxed);
-                process::signal_children(&child_pids);
+                process::trigger_shutdown();
                 status_bar.clear();
                 break;
             }

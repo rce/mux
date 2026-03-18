@@ -3,11 +3,46 @@ use std::path::PathBuf;
 use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::Sender;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 
-/// Shared set of active child PIDs for clean shutdown.
-pub type ChildPids = Arc<Mutex<Vec<u32>>>;
+/// Global shutdown flag, accessible from signal handlers.
+static SHUTDOWN: OnceLock<Arc<AtomicBool>> = OnceLock::new();
+
+/// Global child PIDs, accessible from signal handlers.
+static CHILD_PIDS: OnceLock<Arc<Mutex<Vec<u32>>>> = OnceLock::new();
+
+/// Initialize global shutdown state. Must be called once from main.
+pub fn init_globals(shutdown: Arc<AtomicBool>, pids: Arc<Mutex<Vec<u32>>>) {
+    SHUTDOWN.set(shutdown).ok();
+    CHILD_PIDS.set(pids).ok();
+}
+
+/// Trigger a clean shutdown: set the flag and SIGINT all children.
+/// Safe to call from signal handlers (uses try_lock to avoid deadlock).
+pub fn trigger_shutdown() {
+    if let Some(shutdown) = SHUTDOWN.get() {
+        shutdown.store(true, Ordering::Relaxed);
+    }
+    if let Some(pids) = CHILD_PIDS.get() {
+        // try_lock because we might be in a signal handler
+        if let Ok(pids) = pids.try_lock() {
+            for &pid in pids.iter() {
+                unsafe {
+                    libc::kill(pid as i32, libc::SIGINT);
+                }
+            }
+        }
+    }
+}
+
+pub fn shutdown_flag() -> Arc<AtomicBool> {
+    SHUTDOWN.get().unwrap().clone()
+}
+
+pub fn child_pids() -> Arc<Mutex<Vec<u32>>> {
+    CHILD_PIDS.get().unwrap().clone()
+}
 
 pub enum Event {
     Output(OutputLine),
@@ -23,7 +58,10 @@ pub enum OutputLine {
 }
 
 /// Supervisor loop: spawns the command, reads output, waits for exit, restarts.
-pub fn supervise(idx: usize, cmd: String, tx: Sender<Event>, shutdown: Arc<AtomicBool>, cwd: PathBuf, pids: ChildPids) {
+pub fn supervise(idx: usize, cmd: String, tx: Sender<Event>, cwd: PathBuf) {
+    let shutdown = shutdown_flag();
+    let pids = child_pids();
+
     loop {
         if shutdown.load(Ordering::Relaxed) {
             return;
@@ -128,16 +166,6 @@ pub fn supervise(idx: usize, cmd: String, tx: Sender<Event>, shutdown: Arc<Atomi
         }
 
         let _ = tx.send(Event::Output(OutputLine::Restarted { script_idx: idx }));
-    }
-}
-
-/// Send SIGINT to all active child processes for clean shutdown.
-pub fn signal_children(pids: &ChildPids) {
-    let pids = pids.lock().unwrap();
-    for &pid in pids.iter() {
-        unsafe {
-            libc::kill(pid as i32, libc::SIGINT);
-        }
     }
 }
 
