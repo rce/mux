@@ -19,6 +19,8 @@ struct ScriptState {
     run_state: RunState,
     color: &'static str,
     stop: Arc<AtomicBool>,
+    /// Script was removed from config; kept in list until it fully exits.
+    stopping: bool,
 }
 
 struct LogEntry {
@@ -81,6 +83,7 @@ fn main() {
             run_state: RunState::Running,
             color: display::assign_color(i),
             stop: Arc::new(AtomicBool::new(false)),
+            stopping: false,
         })
         .collect();
 
@@ -190,6 +193,7 @@ fn main() {
                 script_name: ref name,
                 code,
             }) => {
+                let was_stopping = scripts.iter().find(|s| &s.name == name).is_some_and(|s| s.stopping);
                 if let Some(script) = scripts.iter_mut().find(|s| &s.name == name) {
                     script.run_state = RunState::Exited(code);
                     let formatted = display::format_exit_line(
@@ -208,8 +212,12 @@ fn main() {
                     );
                     status_bar.clear();
                     status_bar.print_line(&formatted);
-                    draw_status(&status_bar, &scripts);
                 }
+                // Remove scripts that were stopping (removed from config) now that they've exited
+                if was_stopping {
+                    scripts.retain(|s| !(&s.name == name && s.stopping));
+                }
+                draw_status(&status_bar, &scripts);
                 if shutting_down {
                     exited_count += 1;
                     if exited_count >= scripts.len() {
@@ -280,6 +288,7 @@ fn main() {
 }
 
 /// Apply a config reload: stop removed/changed scripts, start new/changed ones.
+/// Stopped scripts are kept in the list (marked `stopping`) until they fully exit.
 fn apply_config_reload(
     new_config: &config::Config,
     scripts: &mut Vec<ScriptState>,
@@ -287,67 +296,78 @@ fn apply_config_reload(
     tx: &mpsc::Sender<Event>,
     work_dir: &PathBuf,
 ) {
-    // Build lookup of new config by name
     let new_by_name: std::collections::HashMap<&str, &str> = new_config
         .scripts
         .iter()
         .map(|s| (s.name.as_str(), s.cmd.as_str()))
         .collect();
 
-    // Stop removed scripts and scripts whose cmd changed
-    for script in scripts.iter() {
+    // Mark removed and changed-cmd scripts as stopping
+    for script in scripts.iter_mut() {
+        if script.stopping {
+            continue; // already draining from a previous reload
+        }
         match new_by_name.get(script.name.as_str()) {
             None => {
-                // Script was removed
                 script.stop.store(true, Ordering::Relaxed);
+                script.stopping = true;
             }
             Some(&new_cmd) if new_cmd != script.cmd => {
-                // Cmd changed - stop old supervisor
                 script.stop.store(true, Ordering::Relaxed);
+                script.stopping = true;
             }
-            _ => {} // Unchanged - leave running
+            _ => {}
         }
     }
 
-    // Build new scripts list preserving state for unchanged scripts
-    let mut new_scripts: Vec<ScriptState> = Vec::new();
-
-    for (i, new_cfg) in new_config.scripts.iter().enumerate() {
-        let existing = scripts.iter().find(|s| s.name == new_cfg.name);
-        let cmd_changed = existing.is_some_and(|s| s.cmd != new_cfg.cmd);
-
-        if let Some(existing) = existing {
-            if !cmd_changed {
-                // Script unchanged - preserve state
-                new_scripts.push(ScriptState {
-                    name: existing.name.clone(),
-                    cmd: existing.cmd.clone(),
-                    visible: existing.visible,
-                    run_state: existing.run_state.clone(),
-                    color: display::assign_color(i),
-                    stop: existing.stop.clone(),
-                });
-                continue;
-            }
+    // Add new scripts and respawn changed-cmd scripts
+    let mut color_idx = scripts.iter().filter(|s| !s.stopping).count();
+    for new_cfg in &new_config.scripts {
+        let existing = scripts.iter().find(|s| s.name == new_cfg.name && !s.stopping);
+        if existing.is_some() {
+            continue; // unchanged, already running
         }
 
-        // New script or cmd changed - spawn fresh supervisor
+        // Preserve visibility from old entry (even if stopping)
+        let old_visible = scripts.iter().find(|s| s.name == new_cfg.name).map(|s| s.visible);
+
         let stop = Arc::new(AtomicBool::new(false));
         let state = ScriptState {
             name: new_cfg.name.clone(),
             cmd: new_cfg.cmd.clone(),
-            visible: existing.map_or(true, |s| s.visible),
+            visible: old_visible.unwrap_or(true),
             run_state: RunState::Running,
-            color: display::assign_color(i),
+            color: display::assign_color(color_idx),
             stop: stop.clone(),
+            stopping: false,
         };
         spawn_supervisor(&state, tx, work_dir);
-        new_scripts.push(state);
+        scripts.push(state);
+        color_idx += 1;
     }
 
-    *scripts = new_scripts;
+    // Reorder: active scripts in config order, then stopping scripts at the end
+    let config_order: Vec<String> = new_config.scripts.iter().map(|s| s.name.clone()).collect();
+    scripts.sort_by(|a, b| {
+        let a_pos = if a.stopping {
+            usize::MAX
+        } else {
+            config_order.iter().position(|n| n == &a.name).unwrap_or(usize::MAX)
+        };
+        let b_pos = if b.stopping {
+            usize::MAX
+        } else {
+            config_order.iter().position(|n| n == &b.name).unwrap_or(usize::MAX)
+        };
+        a_pos.cmp(&b_pos)
+    });
 
-    // Update name_width for new script set
+    // Reassign colors based on new positions
+    for (i, script) in scripts.iter_mut().enumerate() {
+        script.color = display::assign_color(i);
+    }
+
+    // Update name_width for all scripts (including stopping ones, they still produce output)
     let new_name_width = scripts.iter().map(|s| s.name.len()).max().unwrap_or(1);
     status_bar.set_name_width(new_name_width);
 
