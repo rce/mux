@@ -40,6 +40,8 @@ struct Mux {
     tx: mpsc::Sender<Event>,
     work_dir: PathBuf,
     shutdown: Arc<AtomicBool>,
+    /// Suppress terminal output (used when replaying buffered events)
+    suppress_output: bool,
 }
 
 enum LoopAction {
@@ -112,7 +114,7 @@ impl Mux {
                             always_visible: false,
                         },
                     );
-                    if visible {
+                    if visible && !self.suppress_output {
                         self.status_bar.print_line_with_status(
                             &formatted,
                             &script_views(&self.scripts),
@@ -140,7 +142,7 @@ impl Mux {
                             always_visible: false,
                         },
                     );
-                    if visible {
+                    if visible && !self.suppress_output {
                         self.status_bar.print_line_with_status(
                             &formatted,
                             &script_views(&self.scripts),
@@ -178,11 +180,13 @@ impl Mux {
                 if was_stopping {
                     self.scripts.retain(|s| !(s.name == name && s.stopping));
                 }
-                if !formatted.is_empty() {
-                    self.status_bar
-                        .print_line_with_status(&formatted, &script_views(&self.scripts));
-                } else {
-                    self.status_bar.draw(&script_views(&self.scripts));
+                if !self.suppress_output {
+                    if !formatted.is_empty() {
+                        self.status_bar
+                            .print_line_with_status(&formatted, &script_views(&self.scripts));
+                    } else {
+                        self.status_bar.draw(&script_views(&self.scripts));
+                    }
                 }
                 if self.shutting_down {
                     self.exited_count += 1;
@@ -196,7 +200,9 @@ impl Mux {
                 if let Some(script) = self.scripts.iter_mut().find(|s| s.name == name) {
                     script.run_state = RunState::Restarting;
                 }
-                self.status_bar.draw(&script_views(&self.scripts));
+                if !self.suppress_output {
+                    self.status_bar.draw(&script_views(&self.scripts));
+                }
             }
             Event::Output(OutputLine::Restarted { script_name: name }) => {
                 let formatted = if let Some(script) =
@@ -219,8 +225,10 @@ impl Mux {
                         always_visible: true,
                     },
                 );
-                self.status_bar
-                    .print_line_with_status(&formatted, &script_views(&self.scripts));
+                if !self.suppress_output {
+                    self.status_bar
+                        .print_line_with_status(&formatted, &script_views(&self.scripts));
+                }
             }
             Event::ConfigReloaded(new_config) => {
                 if self.shutting_down {
@@ -234,7 +242,9 @@ impl Mux {
                     &self.tx,
                     &self.work_dir,
                 );
-                self.status_bar.draw(&script_views(&self.scripts));
+                if !self.suppress_output {
+                    self.status_bar.draw(&script_views(&self.scripts));
+                }
             }
             Event::ConfigError(msg) => {
                 let err_msg = format!(
@@ -244,8 +254,10 @@ impl Mux {
                     msg,
                     display::RESET,
                 );
-                self.status_bar
-                    .print_line_with_status(&err_msg, &script_views(&self.scripts));
+                if !self.suppress_output {
+                    self.status_bar
+                        .print_line_with_status(&err_msg, &script_views(&self.scripts));
+                }
             }
             _ => {}
         }
@@ -254,14 +266,17 @@ impl Mux {
 
     fn dismiss_dialog(&mut self) {
         self.url_dialog_open = false;
-        // Process buffered events (updates log/state but doesn't render yet)
+        // Process buffered events silently (update state/log, no rendering)
+        self.suppress_output = true;
         let buffered = std::mem::take(&mut self.buffered_events);
         for event in buffered {
             if matches!(self.handle_event(event), LoopAction::Break) {
+                self.suppress_output = false;
                 return;
             }
         }
-        // Replay the full log to wipe the dialog from the screen
+        self.suppress_output = false;
+        // One clean replay wipes the dialog and shows all output
         replay_visible(&self.status_bar, &self.log, &self.scripts);
     }
 }
@@ -332,6 +347,7 @@ fn main() {
         work_dir: work_dir.clone(),
         shutdown: shutdown.clone(),
         scripts,
+        suppress_output: false,
     };
 
     for script in &mux.scripts {
