@@ -28,6 +28,11 @@ impl RawModeGuard {
             default_hook(info);
         }));
 
+        // Install SIGINT handler so Ctrl+C restores terminal
+        unsafe {
+            libc::signal(libc::SIGINT, sigint_handler as libc::sighandler_t);
+        }
+
         Self
     }
 }
@@ -41,6 +46,15 @@ impl Drop for RawModeGuard {
 fn stdin_fd() -> i32 {
     use std::os::unix::io::AsRawFd;
     io::stdin().as_raw_fd()
+}
+
+extern "C" fn sigint_handler(_: i32) {
+    restore_terminal();
+    // Re-raise SIGINT with default handler so the process exits with correct status
+    unsafe {
+        libc::signal(libc::SIGINT, libc::SIG_DFL);
+        libc::raise(libc::SIGINT);
+    }
 }
 
 fn restore_terminal() {
