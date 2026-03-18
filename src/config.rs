@@ -4,6 +4,13 @@ use std::collections::HashSet;
 #[derive(Debug, Deserialize)]
 pub struct Config {
     pub scripts: Vec<ScriptConfig>,
+    pub urls: Option<Vec<UrlConfig>>,
+}
+
+#[derive(Debug, Deserialize, Clone)]
+pub struct UrlConfig {
+    pub name: String,
+    pub url: String,
 }
 
 #[derive(Debug, Deserialize, Clone)]
@@ -94,5 +101,40 @@ name = "kitten"
 "#;
         let err = parse(toml).unwrap_err();
         assert!(err.contains("invalid config"), "got: {err}");
+    }
+
+    #[test]
+    fn parse_config_with_urls() {
+        let toml = r#"
+[[scripts]]
+name = "whiskers"
+cmd = "echo meow"
+
+[[urls]]
+name = "Catnip Dashboard"
+url = "http://localhost:3000"
+
+[[urls]]
+name = "Litter Box API"
+url = "http://localhost:8080/swagger"
+"#;
+        let config = parse(toml).unwrap();
+        let urls = config.urls.unwrap();
+        assert_eq!(urls.len(), 2);
+        assert_eq!(urls[0].name, "Catnip Dashboard");
+        assert_eq!(urls[0].url, "http://localhost:3000");
+        assert_eq!(urls[1].name, "Litter Box API");
+        assert_eq!(urls[1].url, "http://localhost:8080/swagger");
+    }
+
+    #[test]
+    fn parse_config_without_urls_is_valid() {
+        let toml = r#"
+[[scripts]]
+name = "whiskers"
+cmd = "echo meow"
+"#;
+        let config = parse(toml).unwrap();
+        assert!(config.urls.is_none());
     }
 }

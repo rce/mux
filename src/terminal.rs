@@ -135,6 +135,105 @@ impl StatusBar {
     pub fn name_width(&self) -> usize {
         self.name_width
     }
+
+    /// Draw a URL picker dialog as normal output lines above the status bar.
+    /// The dialog uses box-drawing characters and shows numbered URLs.
+    pub fn draw_url_dialog(&self, urls: &[crate::config::UrlConfig]) {
+        let mut out = io::stdout().lock();
+
+        // Calculate box width: fit the widest entry
+        let max_url_display = 50;
+        let content_width = urls
+            .iter()
+            .map(|u| {
+                let url_display = if u.url.len() > max_url_display {
+                    max_url_display + 2 // for ".."
+                } else {
+                    u.url.len()
+                };
+                // "  N) Name    url  " format
+                4 + u.name.len() + 4 + url_display
+            })
+            .max()
+            .unwrap_or(20);
+
+        // Minimum width for the help text line
+        let help_text = "  Press 1-9 to open, Esc to cancel";
+        let box_inner = content_width.max(help_text.len()).max(20);
+
+        // Clear status bar first
+        write!(out, "\r\x1b[2K").ok();
+
+        // Top border
+        let title = " Open URL ";
+        let remaining = box_inner.saturating_sub(title.len());
+        let right_border = "─".repeat(remaining);
+        write!(
+            out,
+            "\x1b[2K\u{250c}\u{2500}{title}{right_border}\u{2510}\n"
+        )
+        .ok();
+
+        // URL entries
+        for (i, u) in urls.iter().enumerate() {
+            if i >= 9 {
+                break; // max 9 URLs (keys 1-9)
+            }
+            let url_display = if u.url.len() > max_url_display {
+                format!("{}...", &u.url[..max_url_display])
+            } else {
+                u.url.clone()
+            };
+            let entry = format!(
+                "  {bold}{num}){reset} {name}    {url}",
+                bold = display::BOLD,
+                num = i + 1,
+                reset = display::RESET,
+                name = u.name,
+                url = url_display,
+            );
+            // Pad to box width (account for ANSI codes not taking visual space)
+            let visible_len = 5 + u.name.len() + 4 + if u.url.len() > max_url_display {
+                max_url_display + 3
+            } else {
+                u.url.len()
+            };
+            let padding = box_inner.saturating_sub(visible_len);
+            write!(
+                out,
+                "\x1b[2K\u{2502}{entry}{pad}\u{2502}\n",
+                pad = " ".repeat(padding),
+            )
+            .ok();
+        }
+
+        // Empty line
+        write!(
+            out,
+            "\x1b[2K\u{2502}{}\u{2502}\n",
+            " ".repeat(box_inner),
+        )
+        .ok();
+
+        // Help line
+        let help_padding = box_inner.saturating_sub(help_text.len());
+        write!(
+            out,
+            "\x1b[2K\u{2502}{help_text}{}\u{2502}\n",
+            " ".repeat(help_padding),
+        )
+        .ok();
+
+        // Bottom border
+        write!(
+            out,
+            "\x1b[2K\u{2514}{}\u{2518}\n",
+            "─".repeat(box_inner),
+        )
+        .ok();
+
+        out.flush().ok();
+    }
 }
 
 pub struct ScriptView<'a> {

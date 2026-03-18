@@ -87,9 +87,12 @@ fn main() {
         })
         .collect();
 
+    let mut urls: Vec<config::UrlConfig> = config.urls.clone().unwrap_or_default();
+
     let mut log: Vec<LogEntry> = Vec::new();
     let mut shutting_down = false;
     let mut exited_count = 0usize;
+    let mut url_dialog_open = false;
 
     // Spawn supervisor threads
     for script in &scripts {
@@ -123,6 +126,26 @@ fn main() {
         }
 
         match event {
+            // --- URL dialog mode ---
+            Event::Keypress(b @ b'1'..=b'9') if url_dialog_open && !shutting_down => {
+                let idx = (b - b'1') as usize;
+                if idx < urls.len() {
+                    open_url(&urls[idx].url);
+                }
+                url_dialog_open = false;
+                draw_status(&status_bar, &scripts);
+            }
+            Event::Keypress(_) if url_dialog_open => {
+                // Any key (including Escape) dismisses the dialog
+                url_dialog_open = false;
+                draw_status(&status_bar, &scripts);
+            }
+            // --- Normal mode ---
+            Event::Keypress(b'o') if !shutting_down && !urls.is_empty() => {
+                url_dialog_open = true;
+                status_bar.draw_url_dialog(&urls);
+                draw_status(&status_bar, &scripts);
+            }
             Event::Keypress(b'q') if !shutting_down => {
                 shutting_down = true;
                 process::trigger_shutdown();
@@ -261,6 +284,7 @@ fn main() {
                 if shutting_down {
                     continue;
                 }
+                urls = new_config.urls.clone().unwrap_or_default();
                 apply_config_reload(
                     &new_config,
                     &mut scripts,
@@ -423,4 +447,15 @@ fn draw_status(bar: &StatusBar, scripts: &[ScriptState]) {
         })
         .collect();
     bar.draw(&views);
+}
+
+/// Open a URL in the default browser. Uses `open` on macOS, `xdg-open` on Linux.
+fn open_url(url: &str) {
+    let cmd = if cfg!(target_os = "macos") {
+        "open"
+    } else {
+        "xdg-open"
+    };
+    // Spawn detached - we don't care about the result
+    let _ = std::process::Command::new(cmd).arg(url).spawn();
 }
