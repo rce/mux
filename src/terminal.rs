@@ -107,51 +107,55 @@ impl StatusBar {
         out.flush().ok();
     }
 
-    /// Draw the URL picker dialog, then the status bar, in one flush.
-    pub fn draw_url_dialog(&self, urls: &[crate::config::UrlConfig], scripts: &[ScriptView]) {
+    /// Draw a picker dialog with a title, numbered entries, and help text.
+    /// Each entry is a (label, detail) pair. Then draws the status bar.
+    pub fn draw_dialog(
+        &self,
+        title: &str,
+        entries: &[(String, String)],
+        help_text: &str,
+        scripts: &[ScriptView],
+    ) {
         let mut out = io::stdout().lock();
 
-        let max_url_display = 50;
-        let content_width = urls
+        let max_detail = 50;
+        let content_width = entries
             .iter()
-            .map(|u| {
-                let url_len = u.url.len().min(max_url_display + 3);
-                5 + u.name.len() + 4 + url_len
+            .map(|(label, detail)| {
+                let detail_len = detail.len().min(max_detail + 3);
+                5 + label.len() + 4 + detail_len
             })
             .max()
             .unwrap_or(20);
 
-        let help_text = "  Press 1-9 to open, Esc to cancel";
-        let box_inner = content_width.max(help_text.len()).max(20);
+        let box_inner = content_width.max(help_text.len() + 2).max(20);
 
-        // Clear status bar, then draw the dialog
         write!(out, "\r\x1b[2K").ok();
 
         // Top border
-        let title = " Open URL ";
-        let remaining = box_inner.saturating_sub(title.len());
-        write!(out, "┌─{title}{}┐\n", "─".repeat(remaining)).ok();
+        let title_str = format!(" {title} ");
+        let remaining = box_inner.saturating_sub(title_str.len());
+        write!(out, "┌─{title_str}{}┐\n", "─".repeat(remaining)).ok();
 
-        // URL entries
-        for (i, u) in urls.iter().enumerate() {
+        // Entries
+        for (i, (label, detail)) in entries.iter().enumerate() {
             if i >= 9 {
                 break;
             }
-            let url_display = if u.url.len() > max_url_display {
-                format!("{}...", &u.url[..max_url_display])
+            let detail_display = if detail.len() > max_detail {
+                format!("{}...", &detail[..max_detail])
             } else {
-                u.url.clone()
+                detail.clone()
             };
-            let visible_len = 5 + u.name.len() + 4 + url_display.len();
+            let visible_len = 5 + label.len() + 4 + detail_display.len();
             let padding = box_inner.saturating_sub(visible_len);
             write!(
                 out,
-                "│  {bold}{num}){reset} {name}    {url}{pad}│\n",
+                "│  {bold}{num}){reset} {label}    {detail}{pad}│\n",
                 bold = display::BOLD,
                 num = i + 1,
                 reset = display::RESET,
-                name = u.name,
-                url = url_display,
+                detail = detail_display,
                 pad = " ".repeat(padding),
             )
             .ok();
@@ -159,8 +163,9 @@ impl StatusBar {
 
         // Empty line + help text + bottom border
         write!(out, "│{}│\n", " ".repeat(box_inner)).ok();
-        let help_padding = box_inner.saturating_sub(help_text.len());
-        write!(out, "│{help_text}{}│\n", " ".repeat(help_padding)).ok();
+        let help_padded = format!("  {help_text}");
+        let help_padding = box_inner.saturating_sub(help_padded.len());
+        write!(out, "│{help_padded}{}│\n", " ".repeat(help_padding)).ok();
         write!(out, "└{}┘\n", "─".repeat(box_inner)).ok();
 
         self.write_status(&mut out, scripts);

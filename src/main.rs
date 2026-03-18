@@ -28,6 +28,11 @@ struct LogEntry {
     always_visible: bool,
 }
 
+enum Dialog {
+    Urls,
+    Restart,
+}
+
 struct Mux {
     scripts: Vec<ScriptState>,
     urls: Vec<config::UrlConfig>,
@@ -35,12 +40,11 @@ struct Mux {
     status_bar: StatusBar,
     shutting_down: bool,
     exited_count: usize,
-    url_dialog_open: bool,
+    dialog: Option<Dialog>,
     buffered_events: Vec<Event>,
     tx: mpsc::Sender<Event>,
     work_dir: PathBuf,
     shutdown: Arc<AtomicBool>,
-    /// Suppress terminal output (used when replaying buffered events)
     suppress_output: bool,
 }
 
@@ -57,13 +61,22 @@ impl Mux {
             self.shutting_down = true;
         }
 
-        // While URL dialog is open, buffer non-keypress events
-        if self.url_dialog_open {
+        // While a dialog is open, handle selection or buffer non-keypress events
+        if let Some(ref dialog) = self.dialog {
             match event {
                 Event::Keypress(b @ b'1'..=b'9') if !self.shutting_down => {
                     let idx = (b - b'1') as usize;
-                    if idx < self.urls.len() {
-                        open_url(&self.urls[idx].url);
+                    match dialog {
+                        Dialog::Urls => {
+                            if idx < self.urls.len() {
+                                open_url(&self.urls[idx].url);
+                            }
+                        }
+                        Dialog::Restart => {
+                            if idx < self.scripts.len() && !self.scripts[idx].stopping {
+                                self.restart_script(idx);
+                            }
+                        }
                     }
                     self.dismiss_dialog();
                 }
@@ -79,9 +92,10 @@ impl Mux {
 
         match event {
             Event::Keypress(b'o') if !self.shutting_down && !self.urls.is_empty() => {
-                self.url_dialog_open = true;
-                self.status_bar
-                    .draw_url_dialog(&self.urls, &script_views(&self.scripts));
+                self.show_dialog(Dialog::Urls);
+            }
+            Event::Keypress(b'r') if !self.shutting_down && !self.scripts.is_empty() => {
+                self.show_dialog(Dialog::Restart);
             }
             Event::Keypress(b'q') if !self.shutting_down => {
                 self.shutting_down = true;
@@ -264,9 +278,41 @@ impl Mux {
         LoopAction::Continue
     }
 
+    fn show_dialog(&mut self, kind: Dialog) {
+        let views = script_views(&self.scripts);
+        let entries: Vec<(String, String)> = match kind {
+            Dialog::Urls => self
+                .urls
+                .iter()
+                .map(|u| (u.name.clone(), u.url.clone()))
+                .collect(),
+            Dialog::Restart => self
+                .scripts
+                .iter()
+                .filter(|s| !s.stopping)
+                .map(|s| {
+                    let state = match &s.run_state {
+                        RunState::Running => "running".into(),
+                        RunState::Exited(code) => {
+                            let c = code.map_or("signal".into(), |c| c.to_string());
+                            format!("exited ({c})")
+                        }
+                        RunState::Restarting => "restarting".into(),
+                    };
+                    (s.name.clone(), state)
+                })
+                .collect(),
+        };
+        let (title, help) = match kind {
+            Dialog::Urls => ("Open URL", "Press 1-9 to open, Esc to cancel"),
+            Dialog::Restart => ("Restart Script", "Press 1-9 to restart, Esc to cancel"),
+        };
+        self.status_bar.draw_dialog(title, &entries, help, &views);
+        self.dialog = Some(kind);
+    }
+
     fn dismiss_dialog(&mut self) {
-        self.url_dialog_open = false;
-        // Process buffered events silently (update state/log, no rendering)
+        self.dialog = None;
         self.suppress_output = true;
         let buffered = std::mem::take(&mut self.buffered_events);
         for event in buffered {
@@ -276,8 +322,23 @@ impl Mux {
             }
         }
         self.suppress_output = false;
-        // One clean replay wipes the dialog and shows all output
         replay_visible(&self.status_bar, &self.log, &self.scripts);
+    }
+
+    fn restart_script(&mut self, idx: usize) {
+        let script = &mut self.scripts[idx];
+        // Signal the old supervisor to stop
+        script.stop.store(true, Ordering::Relaxed);
+        // Create a fresh stop flag and spawn a new supervisor
+        let new_stop = Arc::new(AtomicBool::new(false));
+        script.stop = new_stop.clone();
+        script.run_state = RunState::Restarting;
+        script.stopping = false;
+        let tx = self.tx.clone();
+        let name = script.name.clone();
+        let cmd = script.cmd.clone();
+        let cwd = self.work_dir.clone();
+        std::thread::spawn(move || process::supervise(name, cmd, tx, cwd, new_stop));
     }
 }
 
@@ -341,7 +402,7 @@ fn main() {
         status_bar: StatusBar::new(name_width),
         shutting_down: false,
         exited_count: 0,
-        url_dialog_open: false,
+        dialog: None,
         buffered_events: Vec::new(),
         tx: tx.clone(),
         work_dir: work_dir.clone(),
