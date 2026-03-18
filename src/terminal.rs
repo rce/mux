@@ -120,6 +120,17 @@ impl StatusBar {
         out.flush().ok();
     }
 
+    /// Clear the entire screen and replay visible lines from the buffer.
+    pub fn replay(&self, lines: &[&str]) {
+        let mut out = io::stdout().lock();
+        // Clear screen and move cursor to top-left
+        write!(out, "\x1b[2J\x1b[H").ok();
+        for line in lines {
+            write!(out, "{line}\n").ok();
+        }
+        out.flush().ok();
+    }
+
     pub fn name_width(&self) -> usize {
         self.name_width
     }

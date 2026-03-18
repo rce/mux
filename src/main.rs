@@ -9,11 +9,20 @@ use std::sync::mpsc;
 use std::sync::Arc;
 use terminal::{RunState, ScriptView, StatusBar};
 
+const MAX_LOG_LINES: usize = 100_000;
+
 struct ScriptState {
     name: String,
     visible: bool,
     run_state: RunState,
     color: &'static str,
+}
+
+struct LogEntry {
+    script_idx: usize,
+    formatted: String,
+    /// Always shown regardless of visibility (exit/restart messages)
+    always_visible: bool,
 }
 
 fn main() {
@@ -47,6 +56,8 @@ fn main() {
         })
         .collect();
 
+    let mut log: Vec<LogEntry> = Vec::new();
+
     // Spawn supervisor threads
     for (i, cfg) in config.scripts.iter().enumerate() {
         let tx = tx.clone();
@@ -76,6 +87,7 @@ fn main() {
                 let idx = (b - b'1') as usize;
                 if idx < scripts.len() {
                     scripts[idx].visible = !scripts[idx].visible;
+                    replay_visible(&status_bar, &log, &scripts);
                     draw_status(&status_bar, &scripts);
                 }
             }
@@ -83,13 +95,14 @@ fn main() {
                 script_idx: idx,
                 line,
             }) => {
+                let formatted = display::format_stdout_line(
+                    &scripts[idx].name,
+                    scripts[idx].color,
+                    &line,
+                    status_bar.name_width(),
+                );
+                push_log(&mut log, LogEntry { script_idx: idx, formatted: formatted.clone(), always_visible: false });
                 if scripts[idx].visible {
-                    let formatted = display::format_stdout_line(
-                        &scripts[idx].name,
-                        scripts[idx].color,
-                        &line,
-                        status_bar.name_width(),
-                    );
                     status_bar.clear();
                     status_bar.print_line(&formatted);
                     draw_status(&status_bar, &scripts);
@@ -99,13 +112,14 @@ fn main() {
                 script_idx: idx,
                 line,
             }) => {
+                let formatted = display::format_stderr_line(
+                    &scripts[idx].name,
+                    scripts[idx].color,
+                    &line,
+                    status_bar.name_width(),
+                );
+                push_log(&mut log, LogEntry { script_idx: idx, formatted: formatted.clone(), always_visible: false });
                 if scripts[idx].visible {
-                    let formatted = display::format_stderr_line(
-                        &scripts[idx].name,
-                        scripts[idx].color,
-                        &line,
-                        status_bar.name_width(),
-                    );
                     status_bar.clear();
                     status_bar.print_line(&formatted);
                     draw_status(&status_bar, &scripts);
@@ -122,6 +136,7 @@ fn main() {
                     code,
                     status_bar.name_width(),
                 );
+                push_log(&mut log, LogEntry { script_idx: idx, formatted: formatted.clone(), always_visible: true });
                 status_bar.clear();
                 status_bar.print_line(&formatted);
                 draw_status(&status_bar, &scripts);
@@ -137,6 +152,7 @@ fn main() {
                     scripts[idx].color,
                     status_bar.name_width(),
                 );
+                push_log(&mut log, LogEntry { script_idx: idx, formatted: formatted.clone(), always_visible: true });
                 status_bar.clear();
                 status_bar.print_line(&formatted);
                 draw_status(&status_bar, &scripts);
@@ -144,6 +160,23 @@ fn main() {
             _ => {}
         }
     }
+}
+
+fn push_log(log: &mut Vec<LogEntry>, entry: LogEntry) {
+    log.push(entry);
+    if log.len() > MAX_LOG_LINES {
+        let drain = log.len() - MAX_LOG_LINES;
+        log.drain(..drain);
+    }
+}
+
+fn replay_visible(bar: &StatusBar, log: &[LogEntry], scripts: &[ScriptState]) {
+    let visible_lines: Vec<&str> = log
+        .iter()
+        .filter(|e| e.always_visible || scripts[e.script_idx].visible)
+        .map(|e| e.formatted.as_str())
+        .collect();
+    bar.replay(&visible_lines);
 }
 
 fn draw_status(bar: &StatusBar, scripts: &[ScriptState]) {
