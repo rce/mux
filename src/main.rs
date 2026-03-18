@@ -4,6 +4,7 @@ mod process;
 mod terminal;
 
 use process::{Event, OutputLine};
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
 use std::sync::Arc;
@@ -26,15 +27,34 @@ struct LogEntry {
 }
 
 fn main() {
-    let config_path = std::env::args().nth(1).unwrap_or_else(|| "mux.toml".into());
+    let config_path = PathBuf::from(
+        std::env::args().nth(1).unwrap_or_else(|| "mux.toml".into()),
+    );
 
-    let config = match config::load(&config_path) {
+    let config = match config::load(config_path.to_str().unwrap_or("mux.toml")) {
         Ok(c) => c,
         Err(e) => {
             eprintln!("mux: {e}");
             std::process::exit(1);
         }
     };
+
+    // Run commands relative to the config file's directory
+    let work_dir = config_path
+        .parent()
+        .map(|p| {
+            if p.as_os_str().is_empty() {
+                PathBuf::from(".")
+            } else {
+                p.to_path_buf()
+            }
+        })
+        .unwrap_or_else(|| PathBuf::from("."))
+        .canonicalize()
+        .unwrap_or_else(|e| {
+            eprintln!("mux: failed to resolve config directory: {e}");
+            std::process::exit(1);
+        });
 
     let name_width = config.scripts.iter().map(|s| s.name.len()).max().unwrap();
 
@@ -63,7 +83,8 @@ fn main() {
         let tx = tx.clone();
         let cmd = cfg.cmd.clone();
         let shutdown = shutdown.clone();
-        std::thread::spawn(move || process::supervise(i, cmd, tx, shutdown));
+        let cwd = work_dir.clone();
+        std::thread::spawn(move || process::supervise(i, cmd, tx, shutdown, cwd));
     }
 
     // Spawn stdin reader

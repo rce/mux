@@ -1,4 +1,5 @@
 use std::io::BufRead;
+use std::path::PathBuf;
 use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::Sender;
@@ -19,7 +20,7 @@ pub enum OutputLine {
 }
 
 /// Supervisor loop: spawns the command, reads output, waits for exit, restarts.
-pub fn supervise(idx: usize, cmd: String, tx: Sender<Event>, shutdown: Arc<AtomicBool>) {
+pub fn supervise(idx: usize, cmd: String, tx: Sender<Event>, shutdown: Arc<AtomicBool>, cwd: PathBuf) {
     loop {
         if shutdown.load(Ordering::Relaxed) {
             return;
@@ -27,6 +28,7 @@ pub fn supervise(idx: usize, cmd: String, tx: Sender<Event>, shutdown: Arc<Atomi
 
         let child = Command::new("sh")
             .args(["-c", &cmd])
+            .current_dir(&cwd)
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .spawn();
