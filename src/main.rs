@@ -19,15 +19,250 @@ struct ScriptState {
     run_state: RunState,
     color: &'static str,
     stop: Arc<AtomicBool>,
-    /// Script was removed from config; kept in list until it fully exits.
     stopping: bool,
 }
 
 struct LogEntry {
     script_name: String,
     formatted: String,
-    /// Always shown regardless of visibility (exit/restart messages)
     always_visible: bool,
+}
+
+struct Mux {
+    scripts: Vec<ScriptState>,
+    urls: Vec<config::UrlConfig>,
+    log: Vec<LogEntry>,
+    status_bar: StatusBar,
+    shutting_down: bool,
+    exited_count: usize,
+    url_dialog_open: bool,
+    buffered_events: Vec<Event>,
+    tx: mpsc::Sender<Event>,
+    work_dir: PathBuf,
+    shutdown: Arc<AtomicBool>,
+}
+
+enum LoopAction {
+    Continue,
+    Break,
+}
+
+impl Mux {
+    /// Handle a single event. Returns Break if the event loop should exit.
+    fn handle_event(&mut self, event: Event) -> LoopAction {
+        // Detect Ctrl+C
+        if !self.shutting_down && self.shutdown.load(Ordering::Relaxed) {
+            self.shutting_down = true;
+        }
+
+        // While URL dialog is open, buffer non-keypress events
+        if self.url_dialog_open {
+            match event {
+                Event::Keypress(b @ b'1'..=b'9') if !self.shutting_down => {
+                    let idx = (b - b'1') as usize;
+                    if idx < self.urls.len() {
+                        open_url(&self.urls[idx].url);
+                    }
+                    self.dismiss_dialog();
+                }
+                Event::Keypress(_) => {
+                    self.dismiss_dialog();
+                }
+                other => {
+                    self.buffered_events.push(other);
+                }
+            }
+            return LoopAction::Continue;
+        }
+
+        match event {
+            Event::Keypress(b'o') if !self.shutting_down && !self.urls.is_empty() => {
+                self.url_dialog_open = true;
+                self.status_bar
+                    .draw_url_dialog(&self.urls, &script_views(&self.scripts));
+            }
+            Event::Keypress(b'q') if !self.shutting_down => {
+                self.shutting_down = true;
+                process::trigger_shutdown();
+            }
+            Event::Keypress(b @ b'1'..=b'9') if !self.shutting_down => {
+                let idx = (b - b'1') as usize;
+                if idx < self.scripts.len() {
+                    self.scripts[idx].visible = !self.scripts[idx].visible;
+                    replay_visible(&self.status_bar, &self.log, &self.scripts);
+                }
+            }
+            Event::Output(OutputLine::Stdout {
+                script_name: name,
+                line,
+            }) => {
+                if let Some(script) = self.scripts.iter().find(|s| s.name == name) {
+                    let formatted = display::format_stdout_line(
+                        &script.name,
+                        script.color,
+                        &line,
+                        self.status_bar.name_width(),
+                    );
+                    let visible = script.visible;
+                    push_log(
+                        &mut self.log,
+                        LogEntry {
+                            script_name: name,
+                            formatted: formatted.clone(),
+                            always_visible: false,
+                        },
+                    );
+                    if visible {
+                        self.status_bar.print_line_with_status(
+                            &formatted,
+                            &script_views(&self.scripts),
+                        );
+                    }
+                }
+            }
+            Event::Output(OutputLine::Stderr {
+                script_name: name,
+                line,
+            }) => {
+                if let Some(script) = self.scripts.iter().find(|s| s.name == name) {
+                    let formatted = display::format_stderr_line(
+                        &script.name,
+                        script.color,
+                        &line,
+                        self.status_bar.name_width(),
+                    );
+                    let visible = script.visible;
+                    push_log(
+                        &mut self.log,
+                        LogEntry {
+                            script_name: name,
+                            formatted: formatted.clone(),
+                            always_visible: false,
+                        },
+                    );
+                    if visible {
+                        self.status_bar.print_line_with_status(
+                            &formatted,
+                            &script_views(&self.scripts),
+                        );
+                    }
+                }
+            }
+            Event::Output(OutputLine::Exited {
+                script_name: name,
+                code,
+            }) => {
+                let was_stopping = self
+                    .scripts
+                    .iter()
+                    .find(|s| s.name == name)
+                    .is_some_and(|s| s.stopping);
+                let mut formatted = String::new();
+                if let Some(script) = self.scripts.iter_mut().find(|s| s.name == name) {
+                    script.run_state = RunState::Exited(code);
+                    formatted = display::format_exit_line(
+                        &script.name,
+                        script.color,
+                        code,
+                        self.status_bar.name_width(),
+                    );
+                    push_log(
+                        &mut self.log,
+                        LogEntry {
+                            script_name: name.clone(),
+                            formatted: formatted.clone(),
+                            always_visible: true,
+                        },
+                    );
+                }
+                if was_stopping {
+                    self.scripts.retain(|s| !(s.name == name && s.stopping));
+                }
+                if !formatted.is_empty() {
+                    self.status_bar
+                        .print_line_with_status(&formatted, &script_views(&self.scripts));
+                } else {
+                    self.status_bar.draw(&script_views(&self.scripts));
+                }
+                if self.shutting_down {
+                    self.exited_count += 1;
+                    if self.exited_count >= self.scripts.len() {
+                        self.status_bar.clear();
+                        return LoopAction::Break;
+                    }
+                }
+            }
+            Event::Output(OutputLine::Restarting { script_name: name }) => {
+                if let Some(script) = self.scripts.iter_mut().find(|s| s.name == name) {
+                    script.run_state = RunState::Restarting;
+                }
+                self.status_bar.draw(&script_views(&self.scripts));
+            }
+            Event::Output(OutputLine::Restarted { script_name: name }) => {
+                let formatted = if let Some(script) =
+                    self.scripts.iter_mut().find(|s| s.name == name)
+                {
+                    script.run_state = RunState::Running;
+                    display::format_restart_line(
+                        &script.name,
+                        script.color,
+                        self.status_bar.name_width(),
+                    )
+                } else {
+                    return LoopAction::Continue;
+                };
+                push_log(
+                    &mut self.log,
+                    LogEntry {
+                        script_name: name,
+                        formatted: formatted.clone(),
+                        always_visible: true,
+                    },
+                );
+                self.status_bar
+                    .print_line_with_status(&formatted, &script_views(&self.scripts));
+            }
+            Event::ConfigReloaded(new_config) => {
+                if self.shutting_down {
+                    return LoopAction::Continue;
+                }
+                self.urls = new_config.urls.clone().unwrap_or_default();
+                apply_config_reload(
+                    &new_config,
+                    &mut self.scripts,
+                    &mut self.status_bar,
+                    &self.tx,
+                    &self.work_dir,
+                );
+                self.status_bar.draw(&script_views(&self.scripts));
+            }
+            Event::ConfigError(msg) => {
+                let err_msg = format!(
+                    "{}{}config error: {}{}",
+                    display::RED,
+                    display::BOLD,
+                    msg,
+                    display::RESET,
+                );
+                self.status_bar
+                    .print_line_with_status(&err_msg, &script_views(&self.scripts));
+            }
+            _ => {}
+        }
+        LoopAction::Continue
+    }
+
+    fn dismiss_dialog(&mut self) {
+        self.url_dialog_open = false;
+        // Process buffered events
+        let buffered = std::mem::take(&mut self.buffered_events);
+        for event in buffered {
+            if matches!(self.handle_event(event), LoopAction::Break) {
+                return;
+            }
+        }
+        self.status_bar.draw(&script_views(&self.scripts));
+    }
 }
 
 fn main() {
@@ -43,7 +278,6 @@ fn main() {
         }
     };
 
-    // Run commands relative to the config file's directory
     let work_dir = config_path
         .parent()
         .map(|p| {
@@ -66,13 +300,11 @@ fn main() {
     let shutdown = Arc::new(AtomicBool::new(false));
     let child_pids = Arc::new(Mutex::new(Vec::new()));
 
-    // Register globals so signal handler can access them
     process::init_globals(shutdown.clone(), child_pids.clone());
 
     let _guard = terminal::RawModeGuard::new();
-    let mut status_bar = StatusBar::new(name_width);
 
-    let mut scripts: Vec<ScriptState> = config
+    let scripts: Vec<ScriptState> = config
         .scripts
         .iter()
         .enumerate()
@@ -87,25 +319,29 @@ fn main() {
         })
         .collect();
 
-    let mut urls: Vec<config::UrlConfig> = config.urls.clone().unwrap_or_default();
+    let mut mux = Mux {
+        urls: config.urls.clone().unwrap_or_default(),
+        log: Vec::new(),
+        status_bar: StatusBar::new(name_width),
+        shutting_down: false,
+        exited_count: 0,
+        url_dialog_open: false,
+        buffered_events: Vec::new(),
+        tx: tx.clone(),
+        work_dir: work_dir.clone(),
+        shutdown: shutdown.clone(),
+        scripts,
+    };
 
-    let mut log: Vec<LogEntry> = Vec::new();
-    let mut shutting_down = false;
-    let mut exited_count = 0usize;
-    let mut url_dialog_open = false;
-
-    // Spawn supervisor threads
-    for script in &scripts {
+    for script in &mux.scripts {
         spawn_supervisor(script, &tx, &work_dir);
     }
 
-    // Spawn stdin reader
     {
         let tx = tx.clone();
         std::thread::spawn(move || process::read_stdin(tx));
     }
 
-    // Spawn config watcher
     {
         let tx = tx.clone();
         let path = config_path
@@ -114,198 +350,15 @@ fn main() {
         std::thread::spawn(move || process::watch_config(path, tx));
     }
 
-    // Keep tx alive for spawning new supervisors during config reload.
-
-    status_bar.draw(&script_views(&scripts));
+    mux.status_bar.draw(&script_views(&mux.scripts));
 
     for event in &rx {
-        // Detect Ctrl+C: shutdown was triggered externally
-        if !shutting_down && shutdown.load(Ordering::Relaxed) {
-            shutting_down = true;
-        }
-
-        match event {
-            // --- URL dialog mode ---
-            Event::Keypress(b @ b'1'..=b'9') if url_dialog_open && !shutting_down => {
-                let idx = (b - b'1') as usize;
-                if idx < urls.len() {
-                    open_url(&urls[idx].url);
-                }
-                url_dialog_open = false;
-                status_bar.draw(&script_views(&scripts));
-            }
-            Event::Keypress(_) if url_dialog_open => {
-                url_dialog_open = false;
-                status_bar.draw(&script_views(&scripts));
-            }
-            // --- Normal mode ---
-            Event::Keypress(b'o') if !shutting_down && !urls.is_empty() => {
-                url_dialog_open = true;
-                status_bar.draw_url_dialog(&urls, &script_views(&scripts));
-            }
-            Event::Keypress(b'q') if !shutting_down => {
-                shutting_down = true;
-                process::trigger_shutdown();
-            }
-            Event::Keypress(b @ b'1'..=b'9') if !shutting_down => {
-                let idx = (b - b'1') as usize;
-                if idx < scripts.len() {
-                    scripts[idx].visible = !scripts[idx].visible;
-                    replay_visible(&status_bar, &log, &scripts);
-                }
-            }
-            Event::Output(OutputLine::Stdout {
-                script_name: ref name,
-                ref line,
-            }) => {
-                if let Some(script) = scripts.iter().find(|s| &s.name == name) {
-                    let formatted = display::format_stdout_line(
-                        &script.name,
-                        script.color,
-                        line,
-                        status_bar.name_width(),
-                    );
-                    let visible = script.visible;
-                    push_log(
-                        &mut log,
-                        LogEntry {
-                            script_name: name.clone(),
-                            formatted: formatted.clone(),
-                            always_visible: false,
-                        },
-                    );
-                    if visible {
-                        status_bar.print_line_with_status(&formatted, &script_views(&scripts));
-                    }
-                }
-            }
-            Event::Output(OutputLine::Stderr {
-                script_name: ref name,
-                ref line,
-            }) => {
-                if let Some(script) = scripts.iter().find(|s| &s.name == name) {
-                    let formatted = display::format_stderr_line(
-                        &script.name,
-                        script.color,
-                        line,
-                        status_bar.name_width(),
-                    );
-                    let visible = script.visible;
-                    push_log(
-                        &mut log,
-                        LogEntry {
-                            script_name: name.clone(),
-                            formatted: formatted.clone(),
-                            always_visible: false,
-                        },
-                    );
-                    if visible {
-                        status_bar.print_line_with_status(&formatted, &script_views(&scripts));
-                    }
-                }
-            }
-            Event::Output(OutputLine::Exited {
-                script_name: ref name,
-                code,
-            }) => {
-                let was_stopping =
-                    scripts.iter().find(|s| &s.name == name).is_some_and(|s| s.stopping);
-                if let Some(script) = scripts.iter_mut().find(|s| &s.name == name) {
-                    script.run_state = RunState::Exited(code);
-                    let formatted = display::format_exit_line(
-                        &script.name,
-                        script.color,
-                        code,
-                        status_bar.name_width(),
-                    );
-                    push_log(
-                        &mut log,
-                        LogEntry {
-                            script_name: name.clone(),
-                            formatted: formatted.clone(),
-                            always_visible: true,
-                        },
-                    );
-                    // Can't call print_line_with_status here because we mutably borrowed scripts
-                    // So we'll draw after the borrow ends
-                }
-                if was_stopping {
-                    scripts.retain(|s| !(&s.name == name && s.stopping));
-                }
-                // Redraw: find the formatted line from the log
-                if let Some(entry) = log.iter().rev().find(|e| &e.script_name == name && e.always_visible) {
-                    status_bar.print_line_with_status(&entry.formatted.clone(), &script_views(&scripts));
-                } else {
-                    status_bar.draw(&script_views(&scripts));
-                }
-                if shutting_down {
-                    exited_count += 1;
-                    if exited_count >= scripts.len() {
-                        status_bar.clear();
-                        break;
-                    }
-                }
-            }
-            Event::Output(OutputLine::Restarting {
-                script_name: ref name,
-            }) => {
-                if let Some(script) = scripts.iter_mut().find(|s| &s.name == name) {
-                    script.run_state = RunState::Restarting;
-                }
-                status_bar.draw(&script_views(&scripts));
-            }
-            Event::Output(OutputLine::Restarted {
-                script_name: ref name,
-            }) => {
-                if let Some(script) = scripts.iter_mut().find(|s| &s.name == name) {
-                    script.run_state = RunState::Running;
-                }
-                let formatted = display::format_restart_line(
-                    scripts.iter().find(|s| &s.name == name).map_or("?", |s| &s.name),
-                    scripts.iter().find(|s| &s.name == name).map_or(display::RESET, |s| s.color),
-                    status_bar.name_width(),
-                );
-                push_log(
-                    &mut log,
-                    LogEntry {
-                        script_name: name.clone(),
-                        formatted: formatted.clone(),
-                        always_visible: true,
-                    },
-                );
-                status_bar.print_line_with_status(&formatted, &script_views(&scripts));
-            }
-            Event::ConfigReloaded(new_config) => {
-                if shutting_down {
-                    continue;
-                }
-                urls = new_config.urls.clone().unwrap_or_default();
-                apply_config_reload(
-                    &new_config,
-                    &mut scripts,
-                    &mut status_bar,
-                    &tx,
-                    &work_dir,
-                );
-                status_bar.draw(&script_views(&scripts));
-            }
-            Event::ConfigError(ref msg) => {
-                let err_msg = format!(
-                    "{}{}config error: {}{}",
-                    display::RED,
-                    display::BOLD,
-                    msg,
-                    display::RESET,
-                );
-                status_bar.print_line_with_status(&err_msg, &script_views(&scripts));
-            }
-            _ => {}
+        if matches!(mux.handle_event(event), LoopAction::Break) {
+            break;
         }
     }
 }
 
-/// Apply a config reload: stop removed/changed scripts, start new/changed ones.
-/// Stopped scripts are kept in the list (marked `stopping`) until they fully exit.
 fn apply_config_reload(
     new_config: &config::Config,
     scripts: &mut Vec<ScriptState>,
@@ -319,7 +372,6 @@ fn apply_config_reload(
         .map(|s| (s.name.as_str(), s.cmd.as_str()))
         .collect();
 
-    // Mark removed and changed-cmd scripts as stopping
     for script in scripts.iter_mut() {
         if script.stopping {
             continue;
@@ -337,7 +389,6 @@ fn apply_config_reload(
         }
     }
 
-    // Add new scripts and respawn changed-cmd scripts
     let mut color_idx = scripts.iter().filter(|s| !s.stopping).count();
     for new_cfg in &new_config.scripts {
         let existing = scripts.iter().find(|s| s.name == new_cfg.name && !s.stopping);
@@ -362,7 +413,6 @@ fn apply_config_reload(
         color_idx += 1;
     }
 
-    // Reorder: active scripts in config order, then stopping scripts at the end
     let config_order: Vec<String> = new_config.scripts.iter().map(|s| s.name.clone()).collect();
     scripts.sort_by(|a, b| {
         let a_pos = if a.stopping {
@@ -378,7 +428,6 @@ fn apply_config_reload(
         a_pos.cmp(&b_pos)
     });
 
-    // Reassign colors based on new positions
     for (i, script) in scripts.iter_mut().enumerate() {
         script.color = display::assign_color(i);
     }
@@ -437,7 +486,6 @@ fn script_views(scripts: &[ScriptState]) -> Vec<ScriptView<'_>> {
         .collect()
 }
 
-/// Open a URL in the default browser. Uses `open` on macOS, `xdg-open` on Linux.
 fn open_url(url: &str) {
     let cmd = if cfg!(target_os = "macos") {
         "open"
