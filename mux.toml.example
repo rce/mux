@@ -1,0 +1,23 @@
+[[scripts]]
+name = "database"
+cmd = "docker compose up --force-recreate --renew-anon-volumes"
+[[scripts]]
+name = "backend"
+cmd = "./run-backend.sh"
+[[scripts]]
+name = "frontend"
+cmd = "./run-frontend.sh"
+[[scripts]]
+name = "integration-fakes"
+cmd = "./run-integration-fakes.sh"
+
+
+[[urls]]
+name = "Frontend"
+url = "http://localhost:3000/"
+[[urls]]
+name = "Admin panel"
+url = "http://localhost:3000/admin"
+[[urls]]
+name = "API docs"
+url = "http://localhost:3000/api/docs"
