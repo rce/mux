@@ -254,14 +254,15 @@ impl Mux {
 
     fn dismiss_dialog(&mut self) {
         self.url_dialog_open = false;
-        // Process buffered events
+        // Process buffered events (updates log/state but doesn't render yet)
         let buffered = std::mem::take(&mut self.buffered_events);
         for event in buffered {
             if matches!(self.handle_event(event), LoopAction::Break) {
                 return;
             }
         }
-        self.status_bar.draw(&script_views(&self.scripts));
+        // Replay the full log to wipe the dialog from the screen
+        replay_visible(&self.status_bar, &self.log, &self.scripts);
     }
 }
 
