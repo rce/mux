@@ -69,6 +69,10 @@ impl StatusBar {
         Self { name_width }
     }
 
+    pub fn set_name_width(&mut self, name_width: usize) {
+        self.name_width = name_width;
+    }
+
     pub fn draw(&self, scripts: &[ScriptView]) {
         let mut out = io::stdout().lock();
 

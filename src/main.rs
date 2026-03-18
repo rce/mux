@@ -5,7 +5,7 @@ mod terminal;
 
 use process::{Event, OutputLine};
 use std::path::PathBuf;
-use std::sync::atomic::AtomicBool;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
 use terminal::{RunState, ScriptView, StatusBar};
@@ -14,13 +14,15 @@ const MAX_LOG_LINES: usize = 100_000;
 
 struct ScriptState {
     name: String,
+    cmd: String,
     visible: bool,
     run_state: RunState,
     color: &'static str,
+    stop: Arc<AtomicBool>,
 }
 
 struct LogEntry {
-    script_idx: usize,
+    script_name: String,
     formatted: String,
     /// Always shown regardless of visibility (exit/restart messages)
     always_visible: bool,
@@ -66,7 +68,7 @@ fn main() {
     process::init_globals(shutdown.clone(), child_pids.clone());
 
     let _guard = terminal::RawModeGuard::new();
-    let status_bar = StatusBar::new(name_width);
+    let mut status_bar = StatusBar::new(name_width);
 
     let mut scripts: Vec<ScriptState> = config
         .scripts
@@ -74,9 +76,11 @@ fn main() {
         .enumerate()
         .map(|(i, cfg)| ScriptState {
             name: cfg.name.clone(),
+            cmd: cfg.cmd.clone(),
             visible: true,
             run_state: RunState::Running,
             color: display::assign_color(i),
+            stop: Arc::new(AtomicBool::new(false)),
         })
         .collect();
 
@@ -85,11 +89,8 @@ fn main() {
     let mut exited_count = 0usize;
 
     // Spawn supervisor threads
-    for (i, cfg) in config.scripts.iter().enumerate() {
-        let tx = tx.clone();
-        let cmd = cfg.cmd.clone();
-        let cwd = work_dir.clone();
-        std::thread::spawn(move || process::supervise(i, cmd, tx, cwd));
+    for script in &scripts {
+        spawn_supervisor(script, &tx, &work_dir);
     }
 
     // Spawn stdin reader
@@ -98,13 +99,23 @@ fn main() {
         std::thread::spawn(move || process::read_stdin(tx));
     }
 
-    drop(tx);
+    // Spawn config watcher
+    {
+        let tx = tx.clone();
+        let path = config_path
+            .canonicalize()
+            .unwrap_or_else(|_| config_path.clone());
+        std::thread::spawn(move || process::watch_config(path, tx));
+    }
+
+    // Keep tx alive for spawning new supervisors during config reload.
+    // The main loop breaks explicitly on shutdown, so we don't need channel close.
 
     draw_status(&status_bar, &scripts);
 
     for event in &rx {
         // Detect Ctrl+C: shutdown was triggered externally
-        if !shutting_down && shutdown.load(std::sync::atomic::Ordering::Relaxed) {
+        if !shutting_down && shutdown.load(Ordering::Relaxed) {
             shutting_down = true;
         }
 
@@ -122,54 +133,83 @@ fn main() {
                 }
             }
             Event::Output(OutputLine::Stdout {
-                script_idx: idx,
-                line,
+                script_name: ref name,
+                ref line,
             }) => {
-                let formatted = display::format_stdout_line(
-                    &scripts[idx].name,
-                    scripts[idx].color,
-                    &line,
-                    status_bar.name_width(),
-                );
-                push_log(&mut log, LogEntry { script_idx: idx, formatted: formatted.clone(), always_visible: false });
-                if scripts[idx].visible {
-                    status_bar.clear();
-                    status_bar.print_line(&formatted);
-                    draw_status(&status_bar, &scripts);
+                if let Some(script) = scripts.iter().find(|s| &s.name == name) {
+                    let formatted = display::format_stdout_line(
+                        &script.name,
+                        script.color,
+                        line,
+                        status_bar.name_width(),
+                    );
+                    let visible = script.visible;
+                    push_log(
+                        &mut log,
+                        LogEntry {
+                            script_name: name.clone(),
+                            formatted: formatted.clone(),
+                            always_visible: false,
+                        },
+                    );
+                    if visible {
+                        status_bar.clear();
+                        status_bar.print_line(&formatted);
+                        draw_status(&status_bar, &scripts);
+                    }
                 }
             }
             Event::Output(OutputLine::Stderr {
-                script_idx: idx,
-                line,
+                script_name: ref name,
+                ref line,
             }) => {
-                let formatted = display::format_stderr_line(
-                    &scripts[idx].name,
-                    scripts[idx].color,
-                    &line,
-                    status_bar.name_width(),
-                );
-                push_log(&mut log, LogEntry { script_idx: idx, formatted: formatted.clone(), always_visible: false });
-                if scripts[idx].visible {
+                if let Some(script) = scripts.iter().find(|s| &s.name == name) {
+                    let formatted = display::format_stderr_line(
+                        &script.name,
+                        script.color,
+                        line,
+                        status_bar.name_width(),
+                    );
+                    let visible = script.visible;
+                    push_log(
+                        &mut log,
+                        LogEntry {
+                            script_name: name.clone(),
+                            formatted: formatted.clone(),
+                            always_visible: false,
+                        },
+                    );
+                    if visible {
+                        status_bar.clear();
+                        status_bar.print_line(&formatted);
+                        draw_status(&status_bar, &scripts);
+                    }
+                }
+            }
+            Event::Output(OutputLine::Exited {
+                script_name: ref name,
+                code,
+            }) => {
+                if let Some(script) = scripts.iter_mut().find(|s| &s.name == name) {
+                    script.run_state = RunState::Exited(code);
+                    let formatted = display::format_exit_line(
+                        &script.name,
+                        script.color,
+                        code,
+                        status_bar.name_width(),
+                    );
+                    push_log(
+                        &mut log,
+                        LogEntry {
+                            script_name: name.clone(),
+                            formatted: formatted.clone(),
+                            always_visible: true,
+                        },
+                    );
                     status_bar.clear();
                     status_bar.print_line(&formatted);
                     draw_status(&status_bar, &scripts);
                 }
-            }
-            Event::Output(OutputLine::Exited {
-                script_idx: idx,
-                code,
-            }) => {
-                scripts[idx].run_state = RunState::Exited(code);
-                let formatted = display::format_exit_line(
-                    &scripts[idx].name,
-                    scripts[idx].color,
-                    code,
-                    status_bar.name_width(),
-                );
-                push_log(&mut log, LogEntry { script_idx: idx, formatted: formatted.clone(), always_visible: true });
-                status_bar.clear();
-                status_bar.print_line(&formatted);
-                draw_status(&status_bar, &scripts);
                 if shutting_down {
                     exited_count += 1;
                     if exited_count >= scripts.len() {
@@ -178,25 +218,156 @@ fn main() {
                     }
                 }
             }
-            Event::Output(OutputLine::Restarting { script_idx: idx }) => {
-                scripts[idx].run_state = RunState::Restarting;
+            Event::Output(OutputLine::Restarting {
+                script_name: ref name,
+            }) => {
+                if let Some(script) = scripts.iter_mut().find(|s| &s.name == name) {
+                    script.run_state = RunState::Restarting;
+                    draw_status(&status_bar, &scripts);
+                }
+            }
+            Event::Output(OutputLine::Restarted {
+                script_name: ref name,
+            }) => {
+                if let Some(script) = scripts.iter_mut().find(|s| &s.name == name) {
+                    script.run_state = RunState::Running;
+                    let formatted = display::format_restart_line(
+                        &script.name,
+                        script.color,
+                        status_bar.name_width(),
+                    );
+                    push_log(
+                        &mut log,
+                        LogEntry {
+                            script_name: name.clone(),
+                            formatted: formatted.clone(),
+                            always_visible: true,
+                        },
+                    );
+                    status_bar.clear();
+                    status_bar.print_line(&formatted);
+                    draw_status(&status_bar, &scripts);
+                }
+            }
+            Event::ConfigReloaded(new_config) => {
+                if shutting_down {
+                    continue;
+                }
+                apply_config_reload(
+                    &new_config,
+                    &mut scripts,
+                    &mut status_bar,
+                    &tx,
+                    &work_dir,
+                );
                 draw_status(&status_bar, &scripts);
             }
-            Event::Output(OutputLine::Restarted { script_idx: idx }) => {
-                scripts[idx].run_state = RunState::Running;
-                let formatted = display::format_restart_line(
-                    &scripts[idx].name,
-                    scripts[idx].color,
-                    status_bar.name_width(),
+            Event::ConfigError(ref msg) => {
+                let err_msg = format!(
+                    "{}{}config error: {}{}",
+                    display::RED,
+                    display::BOLD,
+                    msg,
+                    display::RESET,
                 );
-                push_log(&mut log, LogEntry { script_idx: idx, formatted: formatted.clone(), always_visible: true });
                 status_bar.clear();
-                status_bar.print_line(&formatted);
+                status_bar.print_line(&err_msg);
                 draw_status(&status_bar, &scripts);
             }
             _ => {}
         }
     }
+}
+
+/// Apply a config reload: stop removed/changed scripts, start new/changed ones.
+fn apply_config_reload(
+    new_config: &config::Config,
+    scripts: &mut Vec<ScriptState>,
+    status_bar: &mut StatusBar,
+    tx: &mpsc::Sender<Event>,
+    work_dir: &PathBuf,
+) {
+    // Build lookup of new config by name
+    let new_by_name: std::collections::HashMap<&str, &str> = new_config
+        .scripts
+        .iter()
+        .map(|s| (s.name.as_str(), s.cmd.as_str()))
+        .collect();
+
+    // Stop removed scripts and scripts whose cmd changed
+    for script in scripts.iter() {
+        match new_by_name.get(script.name.as_str()) {
+            None => {
+                // Script was removed
+                script.stop.store(true, Ordering::Relaxed);
+            }
+            Some(&new_cmd) if new_cmd != script.cmd => {
+                // Cmd changed - stop old supervisor
+                script.stop.store(true, Ordering::Relaxed);
+            }
+            _ => {} // Unchanged - leave running
+        }
+    }
+
+    // Build new scripts list preserving state for unchanged scripts
+    let mut new_scripts: Vec<ScriptState> = Vec::new();
+
+    for (i, new_cfg) in new_config.scripts.iter().enumerate() {
+        let existing = scripts.iter().find(|s| s.name == new_cfg.name);
+        let cmd_changed = existing.is_some_and(|s| s.cmd != new_cfg.cmd);
+
+        if let Some(existing) = existing {
+            if !cmd_changed {
+                // Script unchanged - preserve state
+                new_scripts.push(ScriptState {
+                    name: existing.name.clone(),
+                    cmd: existing.cmd.clone(),
+                    visible: existing.visible,
+                    run_state: existing.run_state.clone(),
+                    color: display::assign_color(i),
+                    stop: existing.stop.clone(),
+                });
+                continue;
+            }
+        }
+
+        // New script or cmd changed - spawn fresh supervisor
+        let stop = Arc::new(AtomicBool::new(false));
+        let state = ScriptState {
+            name: new_cfg.name.clone(),
+            cmd: new_cfg.cmd.clone(),
+            visible: existing.map_or(true, |s| s.visible),
+            run_state: RunState::Running,
+            color: display::assign_color(i),
+            stop: stop.clone(),
+        };
+        spawn_supervisor(&state, tx, work_dir);
+        new_scripts.push(state);
+    }
+
+    *scripts = new_scripts;
+
+    // Update name_width for new script set
+    let new_name_width = scripts.iter().map(|s| s.name.len()).max().unwrap_or(1);
+    status_bar.set_name_width(new_name_width);
+
+    // Show reload confirmation
+    let reload_msg = format!(
+        "{}--- config reloaded ---{}",
+        display::BOLD,
+        display::RESET,
+    );
+    status_bar.clear();
+    status_bar.print_line(&reload_msg);
+}
+
+fn spawn_supervisor(script: &ScriptState, tx: &mpsc::Sender<Event>, work_dir: &PathBuf) {
+    let tx = tx.clone();
+    let name = script.name.clone();
+    let cmd = script.cmd.clone();
+    let cwd = work_dir.clone();
+    let stop = script.stop.clone();
+    std::thread::spawn(move || process::supervise(name, cmd, tx, cwd, stop));
 }
 
 fn push_log(log: &mut Vec<LogEntry>, entry: LogEntry) {
@@ -210,7 +381,13 @@ fn push_log(log: &mut Vec<LogEntry>, entry: LogEntry) {
 fn replay_visible(bar: &StatusBar, log: &[LogEntry], scripts: &[ScriptState]) {
     let visible_lines: Vec<&str> = log
         .iter()
-        .filter(|e| e.always_visible || scripts[e.script_idx].visible)
+        .filter(|e| {
+            e.always_visible
+                || scripts
+                    .iter()
+                    .find(|s| s.name == e.script_name)
+                    .is_some_and(|s| s.visible)
+        })
         .map(|e| e.formatted.as_str())
         .collect();
     bar.replay(&visible_lines);
