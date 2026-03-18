@@ -7,7 +7,7 @@ use process::{Event, OutputLine};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use terminal::{RunState, ScriptView, StatusBar};
 
 const MAX_LOG_LINES: usize = 100_000;
@@ -77,6 +77,7 @@ fn main() {
         .collect();
 
     let mut log: Vec<LogEntry> = Vec::new();
+    let child_pids: process::ChildPids = Arc::new(Mutex::new(Vec::new()));
 
     // Spawn supervisor threads
     for (i, cfg) in config.scripts.iter().enumerate() {
@@ -84,7 +85,8 @@ fn main() {
         let cmd = cfg.cmd.clone();
         let shutdown = shutdown.clone();
         let cwd = work_dir.clone();
-        std::thread::spawn(move || process::supervise(i, cmd, tx, shutdown, cwd));
+        let pids = child_pids.clone();
+        std::thread::spawn(move || process::supervise(i, cmd, tx, shutdown, cwd, pids));
     }
 
     // Spawn stdin reader
@@ -101,6 +103,7 @@ fn main() {
         match event {
             Event::Keypress(b'q') => {
                 shutdown.store(true, Ordering::Relaxed);
+                process::signal_children(&child_pids);
                 status_bar.clear();
                 break;
             }

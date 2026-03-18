@@ -3,8 +3,11 @@ use std::path::PathBuf;
 use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::Sender;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
+
+/// Shared set of active child PIDs for clean shutdown.
+pub type ChildPids = Arc<Mutex<Vec<u32>>>;
 
 pub enum Event {
     Output(OutputLine),
@@ -20,7 +23,7 @@ pub enum OutputLine {
 }
 
 /// Supervisor loop: spawns the command, reads output, waits for exit, restarts.
-pub fn supervise(idx: usize, cmd: String, tx: Sender<Event>, shutdown: Arc<AtomicBool>, cwd: PathBuf) {
+pub fn supervise(idx: usize, cmd: String, tx: Sender<Event>, shutdown: Arc<AtomicBool>, cwd: PathBuf, pids: ChildPids) {
     loop {
         if shutdown.load(Ordering::Relaxed) {
             return;
@@ -52,6 +55,9 @@ pub fn supervise(idx: usize, cmd: String, tx: Sender<Event>, shutdown: Arc<Atomi
                 continue;
             }
         };
+
+        let pid = child.id();
+        pids.lock().unwrap().push(pid);
 
         let stdout = child.stdout.take().unwrap();
         let stderr = child.stderr.take().unwrap();
@@ -102,6 +108,8 @@ pub fn supervise(idx: usize, cmd: String, tx: Sender<Event>, shutdown: Arc<Atomi
         stdout_thread.join().ok();
         stderr_thread.join().ok();
 
+        pids.lock().unwrap().retain(|&p| p != pid);
+
         let code = status.ok().and_then(|s| s.code());
         let _ = tx.send(Event::Output(OutputLine::Exited {
             script_idx: idx,
@@ -120,6 +128,16 @@ pub fn supervise(idx: usize, cmd: String, tx: Sender<Event>, shutdown: Arc<Atomi
         }
 
         let _ = tx.send(Event::Output(OutputLine::Restarted { script_idx: idx }));
+    }
+}
+
+/// Send SIGINT to all active child processes for clean shutdown.
+pub fn signal_children(pids: &ChildPids) {
+    let pids = pids.lock().unwrap();
+    for &pid in pids.iter() {
+        unsafe {
+            libc::kill(pid as i32, libc::SIGINT);
+        }
     }
 }
 
