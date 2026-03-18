@@ -58,9 +58,9 @@ pub enum Event {
 pub enum OutputLine {
     Stdout { script_name: String, line: String },
     Stderr { script_name: String, line: String },
-    Exited { script_name: String, code: Option<i32> },
-    Restarting { script_name: String },
-    Restarted { script_name: String },
+    Exited { script_name: String, code: Option<i32>, generation: u64 },
+    Restarting { script_name: String, generation: u64 },
+    Restarted { script_name: String, generation: u64 },
 }
 
 /// Supervisor loop: spawns the command, reads output, waits for exit, restarts.
@@ -72,6 +72,7 @@ pub fn supervise(
     tx: Sender<Event>,
     cwd: PathBuf,
     stop: Arc<AtomicBool>,
+    generation: u64,
 ) {
     let shutdown = shutdown_flag();
     let pids = child_pids();
@@ -99,12 +100,14 @@ pub fn supervise(
                 let _ = tx.send(Event::Output(OutputLine::Exited {
                     script_name: name.clone(),
                     code: None,
+                    generation,
                 }));
                 if stop.load(Ordering::Relaxed) {
                     return;
                 }
                 let _ = tx.send(Event::Output(OutputLine::Restarting {
                     script_name: name.clone(),
+                    generation,
                 }));
                 sleep_or_stop(Duration::from_secs(5), &shutdown, &stop);
                 if shutdown.load(Ordering::Relaxed) || stop.load(Ordering::Relaxed) {
@@ -112,6 +115,7 @@ pub fn supervise(
                 }
                 let _ = tx.send(Event::Output(OutputLine::Restarted {
                     script_name: name.clone(),
+                    generation,
                 }));
                 continue;
             }
@@ -130,6 +134,7 @@ pub fn supervise(
             let _ = tx.send(Event::Output(OutputLine::Exited {
                 script_name: name.clone(),
                 code: None,
+                generation,
             }));
             return;
         }
@@ -212,6 +217,7 @@ pub fn supervise(
         let _ = tx.send(Event::Output(OutputLine::Exited {
             script_name: name.clone(),
             code,
+            generation,
         }));
 
         if shutdown.load(Ordering::Relaxed) || stop.load(Ordering::Relaxed) {
@@ -220,6 +226,7 @@ pub fn supervise(
 
         let _ = tx.send(Event::Output(OutputLine::Restarting {
             script_name: name.clone(),
+            generation,
         }));
         sleep_or_stop(Duration::from_secs(5), &shutdown, &stop);
 
@@ -229,6 +236,7 @@ pub fn supervise(
 
         let _ = tx.send(Event::Output(OutputLine::Restarted {
             script_name: name.clone(),
+            generation,
         }));
     }
 }

@@ -20,6 +20,7 @@ struct ScriptState {
     color: &'static str,
     stop: Arc<AtomicBool>,
     stopping: bool,
+    generation: u64,
 }
 
 struct LogEntry {
@@ -167,15 +168,24 @@ impl Mux {
             Event::Output(OutputLine::Exited {
                 script_name: name,
                 code,
+                generation,
             }) => {
                 let was_stopping = self
                     .scripts
                     .iter()
                     .find(|s| s.name == name)
                     .is_some_and(|s| s.stopping);
+                // Ignore stale events from old supervisors
+                let is_current = self
+                    .scripts
+                    .iter()
+                    .find(|s| s.name == name)
+                    .is_some_and(|s| s.generation == generation);
                 let mut formatted = String::new();
                 if let Some(script) = self.scripts.iter_mut().find(|s| s.name == name) {
-                    script.run_state = RunState::Exited(code);
+                    if is_current {
+                        script.run_state = RunState::Exited(code);
+                    }
                     formatted = display::format_exit_line(
                         &script.name,
                         script.color,
@@ -210,17 +220,17 @@ impl Mux {
                     }
                 }
             }
-            Event::Output(OutputLine::Restarting { script_name: name }) => {
-                if let Some(script) = self.scripts.iter_mut().find(|s| s.name == name) {
+            Event::Output(OutputLine::Restarting { script_name: name, generation }) => {
+                if let Some(script) = self.scripts.iter_mut().find(|s| s.name == name && s.generation == generation) {
                     script.run_state = RunState::Restarting;
                 }
                 if !self.suppress_output {
                     self.status_bar.draw(&script_views(&self.scripts));
                 }
             }
-            Event::Output(OutputLine::Restarted { script_name: name }) => {
+            Event::Output(OutputLine::Restarted { script_name: name, generation }) => {
                 let formatted = if let Some(script) =
-                    self.scripts.iter_mut().find(|s| s.name == name)
+                    self.scripts.iter_mut().find(|s| s.name == name && s.generation == generation)
                 {
                     script.run_state = RunState::Running;
                     display::format_restart_line(
@@ -329,6 +339,9 @@ impl Mux {
         let script = &mut self.scripts[idx];
         // Signal the old supervisor to stop
         script.stop.store(true, Ordering::Relaxed);
+        // Bump generation so we ignore stale events from old supervisor
+        script.generation += 1;
+        let script_gen = script.generation;
         // Create a fresh stop flag and spawn a new supervisor
         let new_stop = Arc::new(AtomicBool::new(false));
         script.stop = new_stop.clone();
@@ -338,7 +351,7 @@ impl Mux {
         let name = script.name.clone();
         let cmd = script.cmd.clone();
         let cwd = self.work_dir.clone();
-        std::thread::spawn(move || process::supervise(name, cmd, tx, cwd, new_stop));
+        std::thread::spawn(move || process::supervise(name, cmd, tx, cwd, new_stop, script_gen));
     }
 }
 
@@ -393,6 +406,7 @@ fn main() {
             color: display::assign_color(i),
             stop: Arc::new(AtomicBool::new(false)),
             stopping: false,
+            generation: 0,
         })
         .collect();
 
@@ -485,6 +499,7 @@ fn apply_config_reload(
             color: display::assign_color(color_idx),
             stop: stop.clone(),
             stopping: false,
+            generation: 0,
         };
         spawn_supervisor(&state, tx, work_dir);
         scripts.push(state);
@@ -527,7 +542,8 @@ fn spawn_supervisor(script: &ScriptState, tx: &mpsc::Sender<Event>, work_dir: &P
     let cmd = script.cmd.clone();
     let cwd = work_dir.clone();
     let stop = script.stop.clone();
-    std::thread::spawn(move || process::supervise(name, cmd, tx, cwd, stop));
+    let script_gen = script.generation;
+    std::thread::spawn(move || process::supervise(name, cmd, tx, cwd, stop, script_gen));
 }
 
 fn push_log(log: &mut Vec<LogEntry>, entry: LogEntry) {
