@@ -81,6 +81,8 @@ fn main() {
         .collect();
 
     let mut log: Vec<LogEntry> = Vec::new();
+    let mut shutting_down = false;
+    let mut exited_count = 0usize;
 
     // Spawn supervisor threads
     for (i, cfg) in config.scripts.iter().enumerate() {
@@ -101,13 +103,17 @@ fn main() {
     draw_status(&status_bar, &scripts);
 
     for event in &rx {
+        // Detect Ctrl+C: shutdown was triggered externally
+        if !shutting_down && shutdown.load(std::sync::atomic::Ordering::Relaxed) {
+            shutting_down = true;
+        }
+
         match event {
-            Event::Keypress(b'q') => {
+            Event::Keypress(b'q') if !shutting_down => {
+                shutting_down = true;
                 process::trigger_shutdown();
-                status_bar.clear();
-                break;
             }
-            Event::Keypress(b @ b'1'..=b'9') => {
+            Event::Keypress(b @ b'1'..=b'9') if !shutting_down => {
                 let idx = (b - b'1') as usize;
                 if idx < scripts.len() {
                     scripts[idx].visible = !scripts[idx].visible;
@@ -164,6 +170,13 @@ fn main() {
                 status_bar.clear();
                 status_bar.print_line(&formatted);
                 draw_status(&status_bar, &scripts);
+                if shutting_down {
+                    exited_count += 1;
+                    if exited_count >= scripts.len() {
+                        status_bar.clear();
+                        break;
+                    }
+                }
             }
             Event::Output(OutputLine::Restarting { script_idx: idx }) => {
                 scripts[idx].run_state = RunState::Restarting;

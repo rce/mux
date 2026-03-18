@@ -49,13 +49,9 @@ fn stdin_fd() -> i32 {
 }
 
 extern "C" fn sigint_handler(_: i32) {
+    // Signal all children to exit but don't kill ourselves yet —
+    // let the main loop drain remaining output before exiting.
     crate::process::trigger_shutdown();
-    restore_terminal();
-    // Re-raise SIGINT with default handler so the process exits with correct status
-    unsafe {
-        libc::signal(libc::SIGINT, libc::SIG_DFL);
-        libc::raise(libc::SIGINT);
-    }
 }
 
 fn restore_terminal() {
