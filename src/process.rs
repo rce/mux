@@ -1,4 +1,5 @@
 use std::io::BufRead;
+use std::os::unix::process::CommandExt;
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -29,7 +30,8 @@ pub fn trigger_shutdown() {
         if let Ok(pids) = pids.try_lock() {
             for &pid in pids.iter() {
                 unsafe {
-                    libc::kill(pid as i32, libc::SIGINT);
+                    // Negative PID signals the entire process group
+                    libc::kill(-(pid as i32), libc::SIGINT);
                 }
             }
         }
@@ -72,6 +74,7 @@ pub fn supervise(idx: usize, cmd: String, tx: Sender<Event>, cwd: PathBuf) {
             .current_dir(&cwd)
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
+            .process_group(0) // own process group so we can signal the whole tree
             .spawn();
 
         let mut child = match child {
