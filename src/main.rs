@@ -281,13 +281,14 @@ impl Mux {
         // Create a fresh stop flag and spawn a new supervisor
         let new_stop = Arc::new(AtomicBool::new(false));
         script.stop = new_stop.clone();
-        script.run_state = RunState::Restarting;
         script.stopping = false;
         let tx = self.tx.clone();
         let name = script.name.clone();
         let cmd = script.cmd.clone();
         let cwd = self.work_dir.clone();
         std::thread::spawn(move || process::supervise(name, cmd, tx, cwd, new_stop, script_gen));
+        // Mark as running — the new supervisor is already spawned
+        script.run_state = RunState::Running;
     }
 }
 
