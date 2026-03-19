@@ -48,7 +48,6 @@ struct Mux {
     name_width: usize,
     scroll_offset: usize,
     shutting_down: bool,
-    exited_count: usize,
     dialog: Option<Dialog>,
     buffered_events: Vec<Event>,
     tx: mpsc::Sender<Event>,
@@ -165,12 +164,6 @@ impl Mux {
                         self.scripts.remove(idx);
                     }
                 }
-                if self.shutting_down {
-                    self.exited_count += 1;
-                    if self.exited_count >= self.scripts.len() {
-                        return LoopAction::Break;
-                    }
-                }
             }
             Event::Output(OutputLine::Restarting {
                 script_name: name,
@@ -262,6 +255,17 @@ impl Mux {
             }
             _ => {}
         }
+
+        // Check if all scripts have exited during shutdown
+        if self.shutting_down
+            && self
+                .scripts
+                .iter()
+                .all(|s| matches!(s.run_state, RunState::Exited(_)))
+        {
+            return LoopAction::Break;
+        }
+
         LoopAction::Continue
     }
 
@@ -388,7 +392,6 @@ fn main() {
         name_width,
         scroll_offset: usize::MAX, // start at bottom (auto-scroll)
         shutting_down: false,
-        exited_count: 0,
         dialog: None,
         buffered_events: Vec::new(),
         tx: tx.clone(),
