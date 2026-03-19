@@ -98,6 +98,14 @@ impl Mux {
             return LoopAction::Continue;
         }
 
+        // When scrolled up, any keypress snaps back to auto-scroll first
+        if self.scroll_offset != usize::MAX {
+            if let Event::Keypress(_) = &event {
+                self.scroll_offset = usize::MAX;
+                return LoopAction::Continue;
+            }
+        }
+
         match event {
             Event::Keypress(b'o') if !self.shutting_down && !self.urls.is_empty() => {
                 self.show_dialog(Dialog::Urls);
