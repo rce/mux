@@ -51,6 +51,8 @@ pub fn child_pids() -> Arc<Mutex<Vec<u32>>> {
 pub enum Event {
     Output(OutputLine),
     Keypress(u8),
+    #[allow(dead_code)]
+    Resize(u16, u16),
     ConfigReloaded(config::Config),
     ConfigError(String),
 }
@@ -287,19 +289,40 @@ pub fn watch_config(path: PathBuf, tx: Sender<Event>) {
     }
 }
 
-/// Reads stdin one byte at a time, sending keypress events.
+/// Reads terminal events via crossterm, sending keypress and resize events.
 pub fn read_stdin(tx: Sender<Event>) {
-    use std::io::Read;
-    let stdin = std::io::stdin();
-    let mut buf = [0u8; 1];
     loop {
-        match stdin.lock().read(&mut buf) {
-            Ok(1) => {
-                if tx.send(Event::Keypress(buf[0])).is_err() {
-                    return;
+        match crossterm::event::read() {
+            Ok(crossterm::event::Event::Key(key)) => {
+                // Only handle Press events (crossterm may send Release too)
+                if key.kind != crossterm::event::KeyEventKind::Press {
+                    continue;
+                }
+                // Convert key events to our Event type
+                match key.code {
+                    crossterm::event::KeyCode::Char(c) => {
+                        if key.modifiers.contains(crossterm::event::KeyModifiers::CONTROL)
+                            && c == 'c'
+                        {
+                            // Ctrl+C: trigger shutdown and send a keypress so main loop sees it
+                            trigger_shutdown();
+                            // Send a sentinel so the main loop can detect ctrl-c
+                            let _ = tx.send(Event::Keypress(0x03)); // ETX
+                            return;
+                        }
+                        let _ = tx.send(Event::Keypress(c as u8));
+                    }
+                    crossterm::event::KeyCode::Esc => {
+                        let _ = tx.send(Event::Keypress(0x1b));
+                    }
+                    _ => {}
                 }
             }
-            _ => return,
+            Ok(crossterm::event::Event::Resize(w, h)) => {
+                let _ = tx.send(Event::Resize(w, h));
+            }
+            Ok(_) => {} // ignore mouse, focus, etc
+            Err(_) => return,
         }
     }
 }

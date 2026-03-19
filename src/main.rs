@@ -3,12 +3,18 @@ mod display;
 mod process;
 mod terminal;
 
-use process::{Event, OutputLine};
+use std::collections::VecDeque;
+use std::io::Stdout;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
-use terminal::{RunState, ScriptView, StatusBar};
+
+use process::{Event, OutputLine};
+use ratatui::backend::CrosstermBackend;
+use ratatui::text::Line;
+use ratatui::Terminal;
+use terminal::{AppState, DialogState, RunState, ScriptView};
 
 const MAX_LOG_LINES: usize = 100_000;
 
@@ -17,7 +23,7 @@ struct ScriptState {
     cmd: String,
     visible: bool,
     run_state: RunState,
-    color: &'static str,
+    color: ratatui::style::Color,
     stop: Arc<AtomicBool>,
     stopping: bool,
     generation: u64,
@@ -25,7 +31,7 @@ struct ScriptState {
 
 struct LogEntry {
     script_name: String,
-    formatted: String,
+    formatted: Line<'static>,
     always_visible: bool,
 }
 
@@ -37,8 +43,9 @@ enum Dialog {
 struct Mux {
     scripts: Vec<ScriptState>,
     urls: Vec<config::UrlConfig>,
-    log: Vec<LogEntry>,
-    status_bar: StatusBar,
+    log: VecDeque<LogEntry>,
+    name_width: usize,
+    scroll_offset: usize,
     shutting_down: bool,
     exited_count: usize,
     dialog: Option<Dialog>,
@@ -46,7 +53,6 @@ struct Mux {
     tx: mpsc::Sender<Event>,
     work_dir: PathBuf,
     shutdown: Arc<AtomicBool>,
-    suppress_output: bool,
 }
 
 enum LoopAction {
@@ -106,138 +112,80 @@ impl Mux {
                 let idx = (b - b'1') as usize;
                 if idx < self.scripts.len() {
                     self.scripts[idx].visible = !self.scripts[idx].visible;
-                    replay_visible(&self.status_bar, &self.log, &self.scripts);
                 }
             }
             Event::Output(OutputLine::Stdout {
                 script_name: name,
                 line,
             }) => {
-                if let Some(script) = self.scripts.iter().find(|s| s.name == name) {
-                    let formatted = display::format_stdout_line(
-                        &script.name,
-                        script.color,
-                        &line,
-                        self.status_bar.name_width(),
-                    );
-                    let visible = script.visible;
-                    push_log(
-                        &mut self.log,
-                        LogEntry {
-                            script_name: name,
-                            formatted: formatted.clone(),
-                            always_visible: false,
-                        },
-                    );
-                    if visible && !self.suppress_output {
-                        self.status_bar.print_line_with_status(
-                            &formatted,
-                            &script_views(&self.scripts),
-                        );
-                    }
-                }
+                self.handle_output(name, line, false);
             }
             Event::Output(OutputLine::Stderr {
                 script_name: name,
                 line,
             }) => {
-                if let Some(script) = self.scripts.iter().find(|s| s.name == name) {
-                    let formatted = display::format_stderr_line(
-                        &script.name,
-                        script.color,
-                        &line,
-                        self.status_bar.name_width(),
-                    );
-                    let visible = script.visible;
-                    push_log(
-                        &mut self.log,
-                        LogEntry {
-                            script_name: name,
-                            formatted: formatted.clone(),
-                            always_visible: false,
-                        },
-                    );
-                    if visible && !self.suppress_output {
-                        self.status_bar.print_line_with_status(
-                            &formatted,
-                            &script_views(&self.scripts),
-                        );
-                    }
-                }
+                self.handle_output(name, line, true);
             }
             Event::Output(OutputLine::Exited {
                 script_name: name,
                 code,
                 generation,
             }) => {
-                let was_stopping = self
-                    .scripts
-                    .iter()
-                    .find(|s| s.name == name)
-                    .is_some_and(|s| s.stopping);
-                // Ignore stale events from old supervisors
-                let is_current = self
-                    .scripts
-                    .iter()
-                    .find(|s| s.name == name)
-                    .is_some_and(|s| s.generation == generation);
-                let mut formatted = String::new();
-                if let Some(script) = self.scripts.iter_mut().find(|s| s.name == name) {
-                    if is_current {
+                let idx = self.scripts.iter().position(|s| s.name == name);
+                if let Some(idx) = idx {
+                    let script = &mut self.scripts[idx];
+                    let was_stopping = script.stopping;
+                    if script.generation == generation {
                         script.run_state = RunState::Exited(code);
                     }
-                    formatted = display::format_exit_line(
+                    let styled = display::styled_exit_line(
                         &script.name,
                         script.color,
                         code,
-                        self.status_bar.name_width(),
+                        self.name_width,
                     );
                     push_log(
                         &mut self.log,
                         LogEntry {
                             script_name: name.clone(),
-                            formatted: formatted.clone(),
+                            formatted: styled,
                             always_visible: true,
                         },
                     );
-                }
-                if was_stopping {
-                    self.scripts.retain(|s| !(s.name == name && s.stopping));
-                }
-                if !self.suppress_output {
-                    if !formatted.is_empty() {
-                        self.status_bar
-                            .print_line_with_status(&formatted, &script_views(&self.scripts));
-                    } else {
-                        self.status_bar.draw(&script_views(&self.scripts));
+                    if was_stopping {
+                        self.scripts.remove(idx);
                     }
                 }
                 if self.shutting_down {
                     self.exited_count += 1;
                     if self.exited_count >= self.scripts.len() {
-                        self.status_bar.clear();
                         return LoopAction::Break;
                     }
                 }
             }
-            Event::Output(OutputLine::Restarting { script_name: name, generation }) => {
-                if let Some(script) = self.scripts.iter_mut().find(|s| s.name == name && s.generation == generation) {
+            Event::Output(OutputLine::Restarting {
+                script_name: name,
+                generation,
+            }) => {
+                if let Some(script) = self
+                    .scripts
+                    .iter_mut()
+                    .find(|s| s.name == name && s.generation == generation)
+                {
                     script.run_state = RunState::Restarting;
                 }
-                if !self.suppress_output {
-                    self.status_bar.draw(&script_views(&self.scripts));
-                }
             }
-            Event::Output(OutputLine::Restarted { script_name: name, generation }) => {
-                let formatted = if let Some(script) =
-                    self.scripts.iter_mut().find(|s| s.name == name && s.generation == generation)
+            Event::Output(OutputLine::Restarted {
+                script_name: name,
+                generation,
+            }) => {
+                let styled = if let Some(script) = self
+                    .scripts
+                    .iter_mut()
+                    .find(|s| s.name == name && s.generation == generation)
                 {
                     script.run_state = RunState::Running;
-                    display::format_restart_line(
-                        &script.name,
-                        script.color,
-                        self.status_bar.name_width(),
-                    )
+                    display::styled_restart_line(&script.name, script.color, self.name_width)
                 } else {
                     return LoopAction::Continue;
                 };
@@ -245,14 +193,10 @@ impl Mux {
                     &mut self.log,
                     LogEntry {
                         script_name: name,
-                        formatted: formatted.clone(),
+                        formatted: styled,
                         always_visible: true,
                     },
                 );
-                if !self.suppress_output {
-                    self.status_bar
-                        .print_line_with_status(&formatted, &script_views(&self.scripts));
-                }
             }
             Event::ConfigReloaded(new_config) => {
                 if self.shutting_down {
@@ -262,77 +206,69 @@ impl Mux {
                 apply_config_reload(
                     &new_config,
                     &mut self.scripts,
-                    &mut self.status_bar,
+                    &mut self.name_width,
                     &self.tx,
                     &self.work_dir,
                 );
-                if !self.suppress_output {
-                    self.status_bar.draw(&script_views(&self.scripts));
-                }
+                let styled = display::styled_config_reload_line();
+                push_log(
+                    &mut self.log,
+                    LogEntry {
+                        script_name: String::new(),
+                        formatted: styled,
+                        always_visible: true,
+                    },
+                );
             }
             Event::ConfigError(msg) => {
-                let err_msg = format!(
-                    "{}{}config error: {}{}",
-                    display::RED,
-                    display::BOLD,
-                    msg,
-                    display::RESET,
+                let styled = display::styled_config_error_line(&msg);
+                push_log(
+                    &mut self.log,
+                    LogEntry {
+                        script_name: String::new(),
+                        formatted: styled,
+                        always_visible: true,
+                    },
                 );
-                if !self.suppress_output {
-                    self.status_bar
-                        .print_line_with_status(&err_msg, &script_views(&self.scripts));
-                }
+            }
+            Event::Resize(_, _) => {
+                // Terminal will redraw on the next draw() call
             }
             _ => {}
         }
         LoopAction::Continue
     }
 
+    fn handle_output(&mut self, name: String, line: String, is_stderr: bool) {
+        if let Some(script) = self.scripts.iter().find(|s| s.name == name) {
+            let styled = if is_stderr {
+                display::styled_stderr_line(&script.name, script.color, &line, self.name_width)
+            } else {
+                display::styled_stdout_line(&script.name, script.color, &line, self.name_width)
+            };
+            push_log(
+                &mut self.log,
+                LogEntry {
+                    script_name: name,
+                    formatted: styled,
+                    always_visible: false,
+                },
+            );
+        }
+    }
+
     fn show_dialog(&mut self, kind: Dialog) {
-        let views = script_views(&self.scripts);
-        let entries: Vec<(String, String)> = match kind {
-            Dialog::Urls => self
-                .urls
-                .iter()
-                .map(|u| (u.name.clone(), u.url.clone()))
-                .collect(),
-            Dialog::Restart => self
-                .scripts
-                .iter()
-                .filter(|s| !s.stopping)
-                .map(|s| {
-                    let state = match &s.run_state {
-                        RunState::Running => "running".into(),
-                        RunState::Exited(code) => {
-                            let c = code.map_or("signal".into(), |c| c.to_string());
-                            format!("exited ({c})")
-                        }
-                        RunState::Restarting => "restarting".into(),
-                    };
-                    (s.name.clone(), state)
-                })
-                .collect(),
-        };
-        let (title, help) = match kind {
-            Dialog::Urls => ("Open URL", "Press 1-9 to open, Esc to cancel"),
-            Dialog::Restart => ("Restart Script", "Press 1-9 to restart, Esc to cancel"),
-        };
-        self.status_bar.draw_dialog(title, &entries, help, &views);
         self.dialog = Some(kind);
     }
 
     fn dismiss_dialog(&mut self) {
         self.dialog = None;
-        self.suppress_output = true;
         let buffered = std::mem::take(&mut self.buffered_events);
         for event in buffered {
             if matches!(self.handle_event(event), LoopAction::Break) {
-                self.suppress_output = false;
                 return;
             }
         }
-        self.suppress_output = false;
-        replay_visible(&self.status_bar, &self.log, &self.scripts);
     }
 
     fn restart_script(&mut self, idx: usize) {
@@ -384,7 +320,7 @@ fn main() {
             std::process::exit(1);
         });
 
-    let name_width = config.scripts.iter().map(|s| s.name.len()).max().unwrap();
+    let name_width = config.scripts.iter().map(|s| s.name.len()).max().unwrap_or(1);
 
     let (tx, rx) = mpsc::channel::<Event>();
     let shutdown = Arc::new(AtomicBool::new(false));
@@ -392,7 +328,16 @@ fn main() {
 
     process::init_globals(shutdown.clone(), child_pids.clone());
 
-    let _guard = terminal::RawModeGuard::new();
+    // Setup ratatui terminal (replaces RawModeGuard)
+    let mut terminal = terminal::setup_terminal().expect("failed to setup terminal");
+
+    // Install panic hook to restore terminal
+    let default_hook = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        let _ = crossterm::terminal::disable_raw_mode();
+        let _ = crossterm::execute!(std::io::stdout(), crossterm::terminal::LeaveAlternateScreen);
+        default_hook(info);
+    }));
 
     let scripts: Vec<ScriptState> = config
         .scripts
@@ -403,7 +348,7 @@ fn main() {
             cmd: cfg.cmd.clone(),
             visible: true,
             run_state: RunState::Running,
-            color: display::assign_color(i),
+            color: display::ratatui_color(i),
             stop: Arc::new(AtomicBool::new(false)),
             stopping: false,
             generation: 0,
@@ -412,8 +357,9 @@ fn main() {
 
     let mut mux = Mux {
         urls: config.urls.clone().unwrap_or_default(),
-        log: Vec::new(),
-        status_bar: StatusBar::new(name_width),
+        log: VecDeque::new(),
+        name_width,
+        scroll_offset: usize::MAX, // start at bottom (auto-scroll)
         shutting_down: false,
         exited_count: 0,
         dialog: None,
@@ -422,18 +368,20 @@ fn main() {
         work_dir: work_dir.clone(),
         shutdown: shutdown.clone(),
         scripts,
-        suppress_output: false,
     };
 
+    // Spawn supervisors
     for script in &mux.scripts {
         spawn_supervisor(script, &tx, &work_dir);
     }
 
+    // Spawn stdin reader
     {
         let tx = tx.clone();
         std::thread::spawn(move || process::read_stdin(tx));
     }
 
+    // Spawn config watcher
     {
         let tx = tx.clone();
         let path = config_path
@@ -442,19 +390,130 @@ fn main() {
         std::thread::spawn(move || process::watch_config(path, tx));
     }
 
-    mux.status_bar.draw(&script_views(&mux.scripts));
+    // Initial draw
+    draw(&mut terminal, &mux);
 
-    for event in &rx {
-        if matches!(mux.handle_event(event), LoopAction::Break) {
+    // Event loop
+    loop {
+        let event = match rx.recv() {
+            Ok(e) => e,
+            Err(_) => break,
+        };
+        let mut action = mux.handle_event(event);
+        // Drain pending events before drawing (coalescing)
+        while let Ok(event) = rx.try_recv() {
+            if matches!(action, LoopAction::Break) {
+                break;
+            }
+            action = mux.handle_event(event);
+        }
+        draw(&mut terminal, &mux);
+        if matches!(action, LoopAction::Break) {
             break;
         }
     }
+
+    // Cleanup
+    terminal::restore_terminal(&mut terminal);
+}
+
+fn draw(terminal: &mut Terminal<CrosstermBackend<Stdout>>, mux: &Mux) {
+    let views = script_views(&mux.scripts);
+    let dialog_entries: Vec<(String, String)>;
+    let dialog_state = match &mux.dialog {
+        Some(Dialog::Urls) => {
+            dialog_entries = mux
+                .urls
+                .iter()
+                .map(|u| (u.name.clone(), u.url.clone()))
+                .collect();
+            Some(DialogState {
+                title: "Open URL",
+                entries: &dialog_entries,
+                help_text: "Press 1-9 to open, Esc to cancel",
+            })
+        }
+        Some(Dialog::Restart) => {
+            dialog_entries = mux
+                .scripts
+                .iter()
+                .filter(|s| !s.stopping)
+                .map(|s| {
+                    let state = match &s.run_state {
+                        RunState::Running => "running".into(),
+                        RunState::Exited(code) => {
+                            let c = code.map_or("signal".into(), |c| c.to_string());
+                            format!("exited ({c})")
+                        }
+                        RunState::Restarting => "restarting".into(),
+                    };
+                    (s.name.clone(), state)
+                })
+                .collect();
+            Some(DialogState {
+                title: "Restart Script",
+                entries: &dialog_entries,
+                help_text: "Press 1-9 to restart, Esc to cancel",
+            })
+        }
+        None => None,
+    };
+
+    // Get terminal height for windowing
+    let term_height = terminal.size().map(|s| s.height as usize).unwrap_or(24);
+    let log_area_height = term_height.saturating_sub(1); // 1 row for status bar
+
+    // Count total visible for scroll calculation
+    let total_visible = mux
+        .log
+        .iter()
+        .filter(|e| {
+            e.always_visible
+                || mux
+                    .scripts
+                    .iter()
+                    .find(|s| s.name == e.script_name)
+                    .is_some_and(|s| s.visible)
+        })
+        .count();
+
+    let scroll_start = if mux.scroll_offset >= total_visible.saturating_sub(log_area_height) {
+        total_visible.saturating_sub(log_area_height)
+    } else {
+        mux.scroll_offset
+    };
+
+    // Build filtered log lines — only the visible window
+    let visible_lines: Vec<Line<'static>> = mux
+        .log
+        .iter()
+        .filter(|e| {
+            e.always_visible
+                || mux
+                    .scripts
+                    .iter()
+                    .find(|s| s.name == e.script_name)
+                    .is_some_and(|s| s.visible)
+        })
+        .skip(scroll_start)
+        .take(log_area_height)
+        .map(|e| e.formatted.clone())
+        .collect();
+
+    let state = AppState {
+        log_lines: &visible_lines,
+        scripts: &views,
+        dialog: dialog_state,
+        scroll_offset: 0, // already windowed, no offset needed
+    };
+
+    let _ = terminal.draw(|frame| terminal::render_ui(frame, &state));
 }
 
 fn apply_config_reload(
     new_config: &config::Config,
     scripts: &mut Vec<ScriptState>,
-    status_bar: &mut StatusBar,
+    name_width: &mut usize,
     tx: &mpsc::Sender<Event>,
     work_dir: &PathBuf,
 ) {
@@ -483,12 +542,17 @@ fn apply_config_reload(
 
     let mut color_idx = scripts.iter().filter(|s| !s.stopping).count();
     for new_cfg in &new_config.scripts {
-        let existing = scripts.iter().find(|s| s.name == new_cfg.name && !s.stopping);
+        let existing = scripts
+            .iter()
+            .find(|s| s.name == new_cfg.name && !s.stopping);
         if existing.is_some() {
             continue;
         }
 
-        let old_visible = scripts.iter().find(|s| s.name == new_cfg.name).map(|s| s.visible);
+        let old_visible = scripts
+            .iter()
+            .find(|s| s.name == new_cfg.name)
+            .map(|s| s.visible);
 
         let stop = Arc::new(AtomicBool::new(false));
         let state = ScriptState {
@@ -496,7 +560,7 @@ fn apply_config_reload(
             cmd: new_cfg.cmd.clone(),
             visible: old_visible.unwrap_or(true),
             run_state: RunState::Running,
-            color: display::assign_color(color_idx),
+            color: display::ratatui_color(color_idx),
             stop: stop.clone(),
             stopping: false,
             generation: 0,
@@ -511,29 +575,27 @@ fn apply_config_reload(
         let a_pos = if a.stopping {
             usize::MAX
         } else {
-            config_order.iter().position(|n| n == &a.name).unwrap_or(usize::MAX)
+            config_order
+                .iter()
+                .position(|n| n == &a.name)
+                .unwrap_or(usize::MAX)
         };
         let b_pos = if b.stopping {
             usize::MAX
         } else {
-            config_order.iter().position(|n| n == &b.name).unwrap_or(usize::MAX)
+            config_order
+                .iter()
+                .position(|n| n == &b.name)
+                .unwrap_or(usize::MAX)
         };
         a_pos.cmp(&b_pos)
     });
 
     for (i, script) in scripts.iter_mut().enumerate() {
-        script.color = display::assign_color(i);
+        script.color = display::ratatui_color(i);
     }
 
-    let new_name_width = scripts.iter().map(|s| s.name.len()).max().unwrap_or(1);
-    status_bar.set_name_width(new_name_width);
-
-    let reload_msg = format!(
-        "{}--- config reloaded ---{}",
-        display::BOLD,
-        display::RESET,
-    );
-    status_bar.print_line_with_status(&reload_msg, &script_views(scripts));
+    *name_width = scripts.iter().map(|s| s.name.len()).max().unwrap_or(1);
 }
 
 fn spawn_supervisor(script: &ScriptState, tx: &mpsc::Sender<Event>, work_dir: &PathBuf) {
@@ -546,27 +608,11 @@ fn spawn_supervisor(script: &ScriptState, tx: &mpsc::Sender<Event>, work_dir: &P
     std::thread::spawn(move || process::supervise(name, cmd, tx, cwd, stop, script_gen));
 }
 
-fn push_log(log: &mut Vec<LogEntry>, entry: LogEntry) {
-    log.push(entry);
-    if log.len() > MAX_LOG_LINES {
-        let drain = log.len() - MAX_LOG_LINES;
-        log.drain(..drain);
+fn push_log(log: &mut VecDeque<LogEntry>, entry: LogEntry) {
+    log.push_back(entry);
+    while log.len() > MAX_LOG_LINES {
+        log.pop_front();
     }
-}
-
-fn replay_visible(bar: &StatusBar, log: &[LogEntry], scripts: &[ScriptState]) {
-    let visible_lines: Vec<&str> = log
-        .iter()
-        .filter(|e| {
-            e.always_visible
-                || scripts
-                    .iter()
-                    .find(|s| s.name == e.script_name)
-                    .is_some_and(|s| s.visible)
-        })
-        .map(|e| e.formatted.as_str())
-        .collect();
-    bar.replay(&visible_lines, &script_views(scripts));
 }
 
 fn script_views(scripts: &[ScriptState]) -> Vec<ScriptView<'_>> {

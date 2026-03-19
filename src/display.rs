@@ -1,41 +1,63 @@
-pub const COLOR_PALETTE: &[&str] = &[
-    "\x1b[36m", // cyan
-    "\x1b[33m", // yellow
-    "\x1b[32m", // green
-    "\x1b[35m", // magenta
-    "\x1b[34m", // blue
-    "\x1b[37m", // white
-    "\x1b[96m", // bright cyan
-    "\x1b[93m", // bright yellow
-    "\x1b[92m", // bright green
+use ratatui::style::{Color, Modifier, Style};
+use ratatui::text::{Line, Span};
+
+pub const RATATUI_COLORS: &[Color] = &[
+    Color::Cyan,
+    Color::Yellow,
+    Color::Green,
+    Color::Magenta,
+    Color::Blue,
+    Color::White,
+    Color::LightCyan,
+    Color::LightYellow,
+    Color::LightGreen,
 ];
-pub const RESET: &str = "\x1b[0m";
-pub const RED: &str = "\x1b[31m";
-pub const BOLD: &str = "\x1b[1m";
-pub const DIM: &str = "\x1b[2m";
 
-pub fn format_stdout_line(name: &str, color: &str, line: &str, name_width: usize) -> String {
-    format!("{color}{name:>name_width$}{RESET} {DIM}|{RESET} {line}")
+pub fn ratatui_color(index: usize) -> Color {
+    RATATUI_COLORS[index % RATATUI_COLORS.len()]
 }
 
-pub fn format_stderr_line(name: &str, color: &str, line: &str, name_width: usize) -> String {
-    format!("{color}{name:>name_width$}{RESET} {DIM}|{RESET} {RED}{line}{RESET}")
+fn styled_log_line(name: &str, color: Color, name_width: usize, content: Span<'static>) -> Line<'static> {
+    Line::from(vec![
+        Span::styled(format!("{name:>name_width$}"), Style::new().fg(color)),
+        Span::styled(" | ", Style::new().add_modifier(Modifier::DIM)),
+        content,
+    ])
 }
 
-pub fn format_exit_line(name: &str, color: &str, code: Option<i32>, name_width: usize) -> String {
+pub fn styled_stdout_line(name: &str, color: Color, line: &str, name_width: usize) -> Line<'static> {
+    styled_log_line(name, color, name_width, Span::raw(line.to_string()))
+}
+
+pub fn styled_stderr_line(name: &str, color: Color, line: &str, name_width: usize) -> Line<'static> {
+    styled_log_line(name, color, name_width, Span::styled(line.to_string(), Style::new().fg(Color::Red)))
+}
+
+pub fn styled_exit_line(name: &str, color: Color, code: Option<i32>, name_width: usize) -> Line<'static> {
     let msg = match code {
         Some(c) => format!("exited with code {c}"),
         None => "exited with signal".into(),
     };
-    format!("{color}{name:>name_width$}{RESET} {DIM}|{RESET} {BOLD}{msg}{RESET}")
+    styled_log_line(name, color, name_width, Span::styled(msg, Style::new().add_modifier(Modifier::BOLD)))
 }
 
-pub fn format_restart_line(name: &str, color: &str, name_width: usize) -> String {
-    format!("{color}{name:>name_width$}{RESET} {DIM}|{RESET} {BOLD}restarting...{RESET}")
+pub fn styled_restart_line(name: &str, color: Color, name_width: usize) -> Line<'static> {
+    styled_log_line(name, color, name_width, Span::styled("restarting...", Style::new().add_modifier(Modifier::BOLD)))
 }
 
-pub fn assign_color(index: usize) -> &'static str {
-    COLOR_PALETTE[index % COLOR_PALETTE.len()]
+pub fn styled_config_reload_line() -> Line<'static> {
+    Line::from(vec![
+        Span::styled("--- config reloaded ---", Style::new().add_modifier(Modifier::BOLD)),
+    ])
+}
+
+pub fn styled_config_error_line(msg: &str) -> Line<'static> {
+    Line::from(vec![
+        Span::styled(
+            format!("config error: {msg}"),
+            Style::new().fg(Color::Red).add_modifier(Modifier::BOLD),
+        ),
+    ])
 }
 
 #[cfg(test)]
@@ -43,45 +65,35 @@ mod tests {
     use super::*;
 
     #[test]
-    fn format_stdout_line_includes_colored_name_and_content() {
-        let result = format_stdout_line("meow", "\x1b[36m", "hello kitty", 6);
-        assert!(result.contains("\x1b[36m"));
-        assert!(result.contains("meow"));
-        assert!(result.contains("hello kitty"));
-        assert!(result.ends_with("hello kitty"));
+    fn styled_stdout_line_has_colored_name_and_content() {
+        let line = styled_stdout_line("meow", Color::Cyan, "hello kitty", 6);
+        assert_eq!(line.spans.len(), 3);
+        assert!(line.spans[0].content.contains("meow"));
+        assert_eq!(line.spans[0].style.fg, Some(Color::Cyan));
+        assert_eq!(line.spans[2].content, "hello kitty");
     }
 
     #[test]
-    fn format_stderr_line_shows_content_in_red() {
-        let result = format_stderr_line("purr", "\x1b[33m", "cat error", 6);
-        assert!(result.contains(RED));
-        assert!(result.contains("cat error"));
-        assert!(result.ends_with(RESET));
+    fn styled_stderr_line_has_red_content() {
+        let line = styled_stderr_line("purr", Color::Yellow, "cat error", 6);
+        assert_eq!(line.spans[2].style.fg, Some(Color::Red));
+        assert_eq!(line.spans[2].content, "cat error");
     }
 
     #[test]
-    fn format_exit_line_shows_exit_code() {
-        let result = format_exit_line("nyan", "\x1b[32m", Some(0), 6);
-        assert!(result.contains("exited with code 0"));
+    fn styled_exit_line_shows_code() {
+        let line = styled_exit_line("nyan", Color::Green, Some(0), 6);
+        assert_eq!(line.spans[2].content, "exited with code 0");
     }
 
     #[test]
-    fn format_exit_line_shows_signal_when_no_code() {
-        let result = format_exit_line("nyan", "\x1b[32m", None, 6);
-        assert!(result.contains("exited with signal"));
+    fn styled_exit_line_shows_signal() {
+        let line = styled_exit_line("nyan", Color::Green, None, 6);
+        assert_eq!(line.spans[2].content, "exited with signal");
     }
 
     #[test]
-    fn format_restart_line_shows_restarting() {
-        let result = format_restart_line("nyan", "\x1b[32m", 6);
-        assert!(result.contains("restarting..."));
-    }
-
-    #[test]
-    fn assign_color_wraps_around_palette() {
-        let first = assign_color(0);
-        let wrapped = assign_color(COLOR_PALETTE.len());
-        assert_eq!(first, wrapped);
-        assert_eq!(assign_color(1), assign_color(COLOR_PALETTE.len() + 1));
+    fn ratatui_color_wraps_around() {
+        assert_eq!(ratatui_color(0), ratatui_color(RATATUI_COLORS.len()));
     }
 }
