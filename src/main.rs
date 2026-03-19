@@ -17,6 +17,7 @@ use ratatui::Terminal;
 use terminal::{AppState, DialogState, RunState, ScriptView};
 
 const MAX_LOG_LINES: usize = 100_000;
+const SCROLL_PAGE_SIZE: usize = 20;
 
 struct ScriptState {
     name: String,
@@ -230,6 +231,23 @@ impl Mux {
                         always_visible: true,
                     },
                 );
+            }
+            Event::ScrollUp => {
+                if self.scroll_offset == usize::MAX {
+                    // Switch from auto-scroll to manual: start near the bottom
+                    self.scroll_offset = self.log.len().saturating_sub(SCROLL_PAGE_SIZE);
+                } else {
+                    self.scroll_offset = self.scroll_offset.saturating_sub(SCROLL_PAGE_SIZE);
+                }
+            }
+            Event::ScrollDown => {
+                if self.scroll_offset != usize::MAX {
+                    self.scroll_offset = self.scroll_offset.saturating_add(SCROLL_PAGE_SIZE);
+                    // Re-engage auto-scroll if we've scrolled past the end
+                    if self.scroll_offset >= self.log.len() {
+                        self.scroll_offset = usize::MAX;
+                    }
+                }
             }
             Event::Resize(_, _) => {
                 // Terminal will redraw on the next draw() call

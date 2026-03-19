@@ -53,6 +53,8 @@ pub enum Event {
     Keypress(u8),
     #[allow(dead_code)]
     Resize(u16, u16),
+    ScrollUp,
+    ScrollDown,
     ConfigReloaded(config::Config),
     ConfigError(String),
 }
@@ -314,6 +316,12 @@ pub fn read_stdin(tx: Sender<Event>) {
                     }
                     crossterm::event::KeyCode::Esc => {
                         let _ = tx.send(Event::Keypress(0x1b));
+                    }
+                    crossterm::event::KeyCode::PageUp => {
+                        let _ = tx.send(Event::ScrollUp);
+                    }
+                    crossterm::event::KeyCode::PageDown => {
+                        let _ = tx.send(Event::ScrollDown);
                     }
                     _ => {}
                 }
