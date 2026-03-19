@@ -101,6 +101,7 @@ fn render_log_area(frame: &mut Frame, area: Rect, state: &AppState) {
     };
 
     let paragraph = Paragraph::new(state.log_lines.to_vec())
+        .wrap(Wrap { trim: false })
         .scroll((offset.min(u16::MAX as usize) as u16, 0));
     frame.render_widget(paragraph, area);
 }
